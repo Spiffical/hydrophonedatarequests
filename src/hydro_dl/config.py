@@ -8,10 +8,13 @@ DEFAULT_ONC_TIMEOUT = 60
 
 # Default parameters for specific product types
 PNG_DEFAULT_PARAMS = dict(dpo_lowerColourLimit=-1000, dpo_upperColourLimit=-1000)
-WAV_DEFAULT_PARAMS = {} # No specific defaults for WAV currently
+WAV_DEFAULT_PARAMS = {
+        'dpo_audioFormatConversion': 0,  # 0 = No conversion (usually)
+        'dpo_audioDownsample': -1      # -1 = No downsampling (usually)
+    }
 
 # Supported file extensions for download
-SUPPORTED_EXTENSIONS = ("wav", "png", "txt")
+SUPPORTED_EXTENSIONS = ("flac", "png", "txt")
 
 # Fallback download settings (can be overridden by args)
 DEFAULT_FALLBACK_RETRIES = 12

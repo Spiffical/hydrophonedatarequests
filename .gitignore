@@ -1,2 +1,4 @@
 /.venv
 /downloads
+src/hydro_dl/__pycache__/*
+src/hydro_dl/__pycache__/args.cpython-310.pyc
