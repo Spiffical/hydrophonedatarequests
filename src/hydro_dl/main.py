@@ -222,86 +222,12 @@ def run_downloader() -> int:
             print("\n=== TEST MODE: Listing Available Files ===")
         all_successful, job_statuses = onc.process_download_jobs(jobs, onc_service, output_path, args)
 
-        # === 7. Generate Detailed Final Summary ===
-        print("\n==============================")
-        if args.test:
-            print("Test Mode Summary:")
-        else:
-            print("Processing Summary:")
-        print("------------------------------")
-        success_count = 0; fail_count = 0; skip_count = 0
-        sorted_job_keys = sorted(job_statuses.keys())
-
-        for job_key in sorted_job_keys:
-            status_info = job_statuses.get(job_key, {})
-            status = status_info.get('status', 'Unknown')
-            reason = status_info.get('reason', '')
-            details = status_info.get('details', {})
-            icon = "❓"
-
-            if status == 'Success': icon = "✅"; success_count += 1
-            elif status == 'Skipped': icon = "⚠️"; skip_count += 1
-            elif status == 'Failed': icon = "❌"; fail_count += 1
-
-            # Print primary status line
-            print(f"{icon} {job_key}: {status}" + (f" ({reason})" if reason else ""))
-
-            # --- Print Details ---
-            if details:
-                if job_key.startswith("Archive_"): # Archive details
-                    if args.test:
-                        # In test mode, show file counts by type
-                        found = details.get('found', '?')
-                        print(f"     └─ Files Found: {found}")
-                        # Show breakdown by extension if available
-                        if 'by_extension' in details:
-                            for ext, count in details['by_extension'].items():
-                                print(f"        └─ {ext}: {count} files")
-                    else:
-                        # Normal mode - show download stats
-                        found = details.get('found', '?')
-                        skipped = details.get('skipped', '?')
-                        downloaded = details.get('downloaded', '?')
-                        failed = details.get('failed', '?')
-                        print(f"     └─ Files Found: {found}, Skipped: {skipped}, Downloaded: {downloaded}, Failed: {failed}")
-                elif job_key.startswith("Req_"): # Data Product details
-                    # Check if download counts are available (i.e., not None)
-                    downloaded = details.get('downloaded')
-                    skipped = details.get('skipped')
-                    expected = details.get('files_expected', '?') # Get expected count
-
-                    if downloaded is not None and skipped is not None:
-                         print(f"     └─ Files Expected: {expected}, Skipped Existing: {skipped}, Downloaded: {downloaded}")
-                    elif status == 'Failed': # Print ONC status for failed jobs if available
-                        onc_status = details.get('onc_status', '?')
-                        if onc_status not in ['FAILED_ON_RUN', 'UNKNOWN', 'STATUS_CHECK_ERROR', 'INVALID_RUN_INFO', '?']:
-                             print(f"     └─ Final ONC Status: {onc_status}")
-            # --- End Print Details ---
-
-        print("------------------------------")
-        # Final outcome message
-        if args.test:
-            if fail_count == 0:
-                print(f"✅ Test completed successfully - found files in {success_count} location(s)!")
-            else:
-                print(f"⚠ Test completed with {success_count} success(es), {fail_count} failure(s).")
-            print(f"Run without --test to download the listed files.")
-        else:
-            if fail_count == 0 and skip_count == 0:
-                print(f"✅ All {success_count} jobs completed successfully!")
-            elif fail_count == 0 and skip_count > 0:
-                print(f"✅ All {success_count} jobs that ran completed successfully ({skip_count} skipped).")
-            else:
-                print(f"⚠ Processing finished with {success_count} success(es), {fail_count} failure(s), {skip_count} skipped.")
-            print(f"Downloaded files location: {output_path}")
-
         end_time = time.time()
         logging.info(f"Total execution time: {end_time - start_time:.2f} seconds.")
         if args.debug_net:
             print("\n--- Final Contents of Output Directory ---")
             utils.list_tree(output_path, args=args)
             print("-" * 41)
-        print("==============================")
 
         # Return overall success code
         return 0 if all_successful else 1

@@ -373,85 +373,134 @@ def select_data_products(
 
     logging.info(f"Fetching available data products/formats for device {first_device_code}...")
     available_data_products = {}  # Store actual data products (like PNG, TXT)
-    flac_available = False  # Flag if FLAC archive likely available
+    flac_available = False  # Flag if FLAC archive likely available (only used in archive mode)
 
     try:
-        # Get actual data products first (PNG, TXT)
+        # Get actual data products first
         prod_opts = onc_client.getDataProducts({"deviceCode": first_device_code})
         if not isinstance(prod_opts, list): prod_opts = []
         utils.dbg("Available data products response", prod_opts, args=args)
 
+        # Group products by extension for better organization
         ext2opt = defaultdict(list)
         for p in prod_opts:
-            # Only check for PNG/TXT here as data products
-            if isinstance(p, dict) and p.get('extension') in ("png", "txt"):
-                ext2opt[p['extension']].append(p)
+            if isinstance(p, dict) and p.get('extension'):
+                ext = p['extension'].lower()
+                # Skip MP3 and WAV files as they are no longer generated
+                if ext in ('mp3', 'wav'):
+                    continue
+                ext2opt[ext].append(p)
         available_data_products = ext2opt
 
-        # Check separately if FLAC archive files likely exist (more robust than checking product list)
-        # We can do a quick, small getArchivefile check or just assume it's possible if it's a hydrophone
-        # For simplicity, let's assume FLAC is *potentially* available if it's a hydrophone
-        # A more robust check would involve trying a getArchivefile with rowLimit=1
-        first_dev_cat = first_deployment.get("deviceCategoryCode", "").upper()
-        if first_dev_cat == "HYDROPHONE":
-            logging.info("Device is a hydrophone, assuming FLAC archive files may be available.")
-            flac_available = True
+        # Only check for FLAC availability in archive mode
+        if args.archive:
+            first_dev_cat = first_deployment.get("deviceCategoryCode", "").upper()
+            if first_dev_cat == "HYDROPHONE":
+                logging.info("Device is a hydrophone, assuming FLAC archive files may be available.")
+                flac_available = True
 
     except Exception as e: raise ONCInteractionError(f"Failed to get data products for {first_device_code}: {e}") from e
 
     if not available_data_products and not flac_available:
-         raise NoDataError(f"No supported data products (PNG, TXT) or FLAC audio found/assumed for device {first_device_code}.")
+         raise NoDataError(f"No data products or FLAC audio found/assumed for device {first_device_code}.")
 
-    # Determine which extensions to request based on CLI args or prompts
-    # --- Update to use args.flac ---
-    wanted_explicit = {"flac": args.flac, "png": args.png, "txt": args.txt}
+    # Print available data products in a nice format
+    print("\nAvailable Data Products:")
+    print("-" * 80)
+    
+    # Only show FLAC if in archive mode and available
+    if args.archive and flac_available:
+        print("FLAC Archive:")
+        print("  - Raw FLAC Audio Files (Archive)")
+        print()
+    
+    # Then show other data products grouped by extension
+    for ext in sorted(available_data_products.keys()):
+        products = available_data_products[ext]
+        print(f"{ext.upper()} Products:")
+        for p in products:
+            name = p.get('dataProductName', 'Unknown')
+            code = p.get('dataProductCode', 'Unknown')
+            desc = p.get('description', '').strip()
+            print(f"  - {name} ({code})")
+            if desc: print(f"    Description: {desc}")
+        print()
+    print("-" * 80)
+
+    # Determine which products to request based on CLI args or prompts
+    wanted_explicit = {"flac": args.flac and args.archive, "png": args.png, "txt": args.txt}  # Only allow FLAC with archive flag
     cli_wants_any = any(wanted_explicit.values())
-    wanted_exts = []
+    chosen_products = {}
 
     if cli_wants_any:
-        temp_wanted = []
-        if wanted_explicit["flac"] and flac_available: temp_wanted.append("flac")
-        if wanted_explicit["png"] and "png" in available_data_products: temp_wanted.append("png")
-        if wanted_explicit["txt"] and "txt" in available_data_products: temp_wanted.append("txt")
-        wanted_exts = temp_wanted
-        if not wanted_exts:
-             requested_types = [k for k,v in wanted_explicit.items() if v]
-             logging.warning(f"CLI flags specified {requested_types}, but none are available/assumed for {first_device_code}.")
-             raise NoDataError(f"Requested data types not available for device {first_device_code}.")
+        # Handle CLI-specified products
+        if wanted_explicit["flac"] and flac_available:
+            chosen_products["flac"] = {"dataProductCode": "ARCHIVE_FLAC", "extension": "flac", "dataProductName": "Archived FLAC Audio"}
+            logging.info("Selected FLAC: Archived FLAC Audio")
+        
+        for ext, wanted in wanted_explicit.items():
+            if wanted and ext in available_data_products:
+                # For each extension, show available products and let user pick
+                products = available_data_products[ext]
+                if len(products) == 1:
+                    chosen_products[ext] = products[0]
+                    logging.info(f"Selected {ext.upper()}: {products[0].get('dataProductName','?')} ({products[0].get('dataProductCode','?')})")
+                else:
+                    print(f"\nMultiple {ext.upper()} products available. Please select one:")
+                    for i, p in enumerate(products):
+                        print(f"{i+1}. {p.get('dataProductName', '?')} ({p.get('dataProductCode', '?')})")
+                    try:
+                        choice = ui.prompt_pick([f"{p.get('dataProductName', '?')} ({p.get('dataProductCode', '?')})" for p in products],
+                                              f"Select {ext.upper()} product")
+                        chosen_products[ext] = products[choice]
+                        logging.info(f"Selected {ext.upper()}: {products[choice].get('dataProductName','?')} ({products[choice].get('dataProductCode','?')})")
+                    except (EOFError, KeyboardInterrupt):
+                        raise ui.UserAbortError("User aborted.")
+        
+        if not chosen_products:
+            requested_types = [k for k,v in wanted_explicit.items() if v]
+            logging.warning(f"CLI flags specified {requested_types}, but none are available for {first_device_code}.")
+            raise NoDataError(f"Requested data types not available for device {first_device_code}.")
+    
     else:
-        print("\nSelect data types to download:")
-        prompted_exts = []
-        # --- Prompt for FLAC ---
-        if flac_available:
+        # Interactive selection
+        print("\nSelect data products to download:")
+        
+        # Only prompt for FLAC if in archive mode and available
+        if args.archive and flac_available:
             try:
-                ans = input(f"Fetch FLAC (Archived Audio)? [y/N] ").lower()
-                if ans == 'y': prompted_exts.append("flac")
-            except (EOFError, KeyboardInterrupt): raise ui.UserAbortError("User aborted.")
-        # --- End FLAC Prompt ---
-        for ext in ("png", "txt"): # Prompt for PNG/TXT if available
-            if ext in available_data_products:
-                try:
-                    prod_name = available_data_products[ext][0].get('dataProductName', '?') if available_data_products[ext] else '?'
-                    ans = input(f"Fetch {ext.upper()} ({prod_name})? [y/N] ").lower()
-                    if ans == 'y': prompted_exts.append(ext)
-                except (EOFError, KeyboardInterrupt): raise ui.UserAbortError("User aborted.")
-        wanted_exts = prompted_exts
+                ans = input(f"Download FLAC (Archived Audio)? [y/N] ").lower()
+                if ans == 'y':
+                    chosen_products["flac"] = {"dataProductCode": "ARCHIVE_FLAC", "extension": "flac", "dataProductName": "Archived FLAC Audio"}
+                    logging.info("Selected FLAC: Archived FLAC Audio")
+            except (EOFError, KeyboardInterrupt):
+                raise ui.UserAbortError("User aborted.")
+        
+        # Then prompt for each available extension
+        for ext in sorted(available_data_products.keys()):
+            products = available_data_products[ext]
+            if not products:
+                continue
+                
+            try:
+                # First ask if they want this type at all
+                ans = input(f"\nDownload {ext.upper()} products? [y/N] ").lower()
+                if ans == 'y':
+                    if len(products) == 1:
+                        chosen_products[ext] = products[0]
+                        logging.info(f"Selected {ext.upper()}: {products[0].get('dataProductName','?')} ({products[0].get('dataProductCode','?')})")
+                    else:
+                        print(f"\nMultiple {ext.upper()} products available. Please select one:")
+                        choice = ui.prompt_pick([f"{p.get('dataProductName', '?')} ({p.get('dataProductCode', '?')})" for p in products],
+                                              f"Select {ext.upper()} product")
+                        chosen_products[ext] = products[choice]
+                        logging.info(f"Selected {ext.upper()}: {products[choice].get('dataProductName','?')} ({products[choice].get('dataProductCode','?')})")
+            except (EOFError, KeyboardInterrupt):
+                raise ui.UserAbortError("User aborted.")
 
-    if not wanted_exts: raise NoDataError("No data types were selected.")
+    if not chosen_products:
+        raise NoDataError("No data products were selected.")
 
-    # Prepare the final dictionary - FLAC needs a placeholder 'product' dict
-    chosen_products = {}
-    if "flac" in wanted_exts:
-         chosen_products["flac"] = {"dataProductCode": "ARCHIVE_FLAC", "extension": "flac", "dataProductName": "Archived FLAC Audio"}
-         logging.info(f"Selected FLAC: Archived FLAC Audio")
-    if "png" in wanted_exts:
-         chosen_products["png"] = available_data_products["png"][0]
-         logging.info(f"Selected PNG: {chosen_products['png'].get('dataProductName','?')} ({chosen_products['png'].get('dataProductCode','?')})")
-    if "txt" in wanted_exts:
-         chosen_products["txt"] = available_data_products["txt"][0]
-         logging.info(f"Selected TXT: {chosen_products['txt'].get('dataProductName','?')} ({chosen_products['txt'].get('dataProductCode','?')})")
-
-    if not chosen_products: raise NoDataError("No valid products/formats could be selected.")
     return chosen_products
 
 
@@ -586,34 +635,83 @@ def request_onc_jobs(
                 raise ONCInteractionError(f"Failed to list archive files: {e}")
                 
         else:
-            # Normal data product mode - process each requested extension
+            # Normal data product mode - process each requested product
             for ext, prod in chosen_products.items():
-                logging.info(f"Preparing ARCHIVE request for {ext.upper()}...")
-                archive_filters = dict(
-                    deviceCode=device_code,
-                    dateFrom=utils.iso(start_utc),
-                    dateTo=utils.iso(end_utc),
-                    extension=ext
-                )
-                utils.dbg("Archive Request Filters:", archive_filters, args=args)
-                jobs.append(('archive', archive_filters, device_code, ext))
-                
-                # Size estimation as before
                 if ext == 'flac':
+                    # Handle FLAC as archive request
+                    logging.info(f"Preparing FLAC archive request...")
+                    archive_filters = dict(
+                        deviceCode=device_code,
+                        dateFrom=utils.iso(start_utc),
+                        dateTo=utils.iso(end_utc),
+                        extension='flac'
+                    )
+                    utils.dbg("FLAC Archive Request Filters:", archive_filters, args=args)
+                    jobs.append(('archive', archive_filters, device_code, ext))
+                    
+                    # Size estimation for FLAC
                     duration_hours = (end_utc - start_utc).total_seconds() / 3600
                     rough_flac_est_mb = duration_hours * 6 * 100
                     total_bytes_est += int(rough_flac_est_mb * 1048576)
-                    logging.info(f"  Archive request prepared. Rough Est: {utils.human_size(int(rough_flac_est_mb*1048576))}")
-                elif ext == 'png':
-                    duration_hours = (end_utc - start_utc).total_seconds() / 3600
-                    rough_png_est_mb = duration_hours * 0.5
-                    total_bytes_est += int(rough_png_est_mb * 1048576)
-                    logging.info(f"  Archive request prepared. Rough Est: {utils.human_size(int(rough_png_est_mb*1048576))}")
-                elif ext == 'txt':
-                    duration_hours = (end_utc - start_utc).total_seconds() / 3600
-                    rough_txt_est_mb = duration_hours * 0.1
-                    total_bytes_est += int(rough_txt_est_mb * 1048576)
-                    logging.info(f"  Archive request prepared. Rough Est: {utils.human_size(int(rough_txt_est_mb*1048576))}")
+                    logging.info(f"  FLAC archive request prepared. Rough Est: {utils.human_size(int(rough_flac_est_mb*1048576))}")
+                else:
+                    # Handle other data products (PNG, TXT, etc.)
+                    logging.info(f"Preparing {ext.upper()} data product request...")
+                    dp_filters = dict(
+                        deviceCode=device_code,
+                        dateFrom=utils.iso(start_utc),
+                        dateTo=utils.iso(end_utc),
+                        dataProductCode=prod.get('dataProductCode'),
+                        extension=ext
+                    )
+                    utils.dbg(f"{ext.upper()} Data Product Request Filters:", dp_filters, args=args)
+                    
+                    try:
+                        # Request the data product to get size estimate
+                        request_result = onc_client.requestDataProduct(filters=dp_filters)
+                        if isinstance(request_result, dict):
+                            request_id = request_result.get('dpRequestId')
+                            if request_id:
+                                jobs.append(('dataproduct', request_id, device_code, ext))
+                                # Parse size estimate - handle both byte count and human readable formats
+                                est_size = 0
+                                size_str = str(request_result.get('estimatedFileSize', '')).lower()
+                                if size_str and 'no' not in size_str and 'available' not in size_str:  # Skip "no ... available" messages
+                                    if 'mb' in size_str:
+                                        try:
+                                            est_size = int(float(size_str.replace('mb','').strip()) * 1024 * 1024)
+                                        except ValueError:
+                                            est_size = 0
+                                    elif 'kb' in size_str:
+                                        try:
+                                            est_size = int(float(size_str.replace('kb','').strip()) * 1024)
+                                        except ValueError:
+                                            est_size = 0
+                                    elif 'b' in size_str:
+                                        try:
+                                            est_size = int(float(size_str.replace('b','').strip()))
+                                        except ValueError:
+                                            est_size = 0
+                                    else:
+                                        try:
+                                            est_size = int(size_str)
+                                        except ValueError:
+                                            est_size = 0
+                                elif 'downloadSize' in request_result:
+                                    try:
+                                        est_size = int(request_result['downloadSize'])
+                                    except (ValueError, TypeError):
+                                        est_size = 0
+                                total_bytes_est += est_size
+                                size_display = utils.human_size(est_size) if est_size > 0 else "unknown size"
+                                logging.info(f"  {ext.upper()} request prepared. Est: {size_display}")
+                            else:
+                                logging.warning(f"No request ID returned for {ext.upper()} product. Skipping.")
+                        else:
+                            logging.warning(f"Unexpected response for {ext.upper()} product request. Skipping.")
+                    except Exception as e:
+                        logging.error(f"Error requesting {ext.upper()} product: {e}", exc_info=args.debug)
+                        raise ONCInteractionError(f"Failed to request {ext.upper()} data product: {e}")
 
     if not jobs:
         raise NoDataError("No archive requests or data product jobs could be prepared.")
@@ -664,7 +762,8 @@ def _attempt_fallback_download(
 
     # If file count is still unknown, poll status and try internal count method
     if file_count < 0:
-        initial_wait = 3.0 # Short wait before first status check
+        # Add longer initial wait for MAT files
+        initial_wait = 5.0 if file_ext.lower() == 'mat' else 3.0
         logging.info(f"Fallback: File count unknown. Waiting {initial_wait}s then polling status for request {request_id}...")
         time.sleep(initial_wait)
         onc_status = 'UNKNOWN'
@@ -727,7 +826,9 @@ def _attempt_fallback_download(
 
             # Wait before the next attempt
             if attempt < args.fallback_retries:
-                time.sleep(args.fallback_wait)
+                # Add exponential backoff for MAT files
+                wait_time = args.fallback_wait * (2 ** attempt) if file_ext.lower() == 'mat' else args.fallback_wait
+                time.sleep(wait_time)
             else:
                 logging.error(f"Fallback timed out waiting for request {request_id} to complete (last status: {onc_status}).")
                 file_count = -1 # Mark as failed due to timeout
@@ -782,6 +883,10 @@ def _attempt_fallback_download(
     files_failed_count = 0
     files_skipped_count = 0 # Count files skipped because they already exist
 
+    # Add longer wait between files for MAT/PDF files
+    needs_longer_wait = file_ext.lower() in ('mat', 'pdf')
+    inter_file_wait = 2.0 if needs_longer_wait else 0.5
+
     for f_info in file_list_infos:
         index_to_download = f_info.get('index')
         if not index_to_download:
@@ -795,8 +900,8 @@ def _attempt_fallback_download(
         actual_filename = potential_filename # Default name if download fails early
 
         try:
-            # Small delay between individual file requests might help avoid rate limits
-            time.sleep(0.5) # Shorter delay for individual files
+            # Small delay between individual file requests
+            time.sleep(inter_file_wait)
 
             # Use _DataProductFile internal class to download this specific file index
             downloader = _DataProductFile(actual_run_id, index_to_download, onc_client.baseUrl, onc_client.token)
@@ -806,10 +911,10 @@ def _attempt_fallback_download(
             # It takes different parameters (e.g., pollPeriod might not be used same way)
             # We set overwrite=True to match the main download logic intent
             status_code = downloader.download(
-                timeout=onc_client.timeout,      # Use main client timeout
-                pollPeriod=1.0,                # Internal download handles its own retries/logic
+                timeout=onc_client.timeout,  # Required parameter - use client's timeout
+                pollPeriod=2.0 if needs_longer_wait else 1.0,  # Longer poll period for MAT/PDF files
                 outPath=onc_client.outPath,      # Use main client output path
-                maxRetries=3,                    # Use a few retries for individual files
+                maxRetries=5 if needs_longer_wait else 3,  # More retries for MAT/PDF files
                 overwrite=True                   # Overwrite if exists locally
             )
 
@@ -850,6 +955,28 @@ def _attempt_fallback_download(
             logging.error(f"  -> Fail: System error downloading index {index_to_download}, runId {actual_run_id}: {download_err}", exc_info=args.debug)
             files_failed_count += 1
 
+            # For MAT/PDF files, add extra retry with longer wait on failure
+            if needs_longer_wait:
+                try:
+                    logging.info(f"  -> Retrying {file_ext.upper()} file download after 10s wait...")
+                    time.sleep(10)
+                    status_code = downloader.download(
+                        timeout=onc_client.timeout,  # Required parameter - use client's timeout
+                        pollPeriod=5.0,  # Longer poll period for retry
+                        outPath=onc_client.outPath,
+                        maxRetries=3,
+                        overwrite=True
+                    )
+                    if status_code == 200:
+                        size = downloader.getInfo().get('size', 0)
+                        logging.info(f"  -> Retry OK: {actual_filename} (Idx:{index_to_download}, Size:{utils.human_size(size)})")
+                        files_downloaded_count += 1
+                        files_failed_count -= 1  # Remove from failed count since retry succeeded
+                    else:
+                        logging.error(f"  -> Retry failed with status code: {status_code}")
+                except Exception as retry_err:
+                    logging.error(f"  -> Retry failed: {retry_err}")
+
     # --- 4. Fallback Summary ---
     total_processed = files_downloaded_count + files_skipped_count + files_failed_count
     expected_total = len(file_list_infos) # Use the count of infos we attempted to download
@@ -865,8 +992,7 @@ def _attempt_fallback_download(
         fallback_succeeded = False
 
     if total_processed != expected_total:
-         logging.warning(f"Fallback Discrepancy: Processed {total_processed} files, but expected to process {expected_total} based on generated info list.")
-
+         logging.warning(f"Fallback Discrepancy: Processed {total_processed} files, but expected {expected_total} based on generated info list.")
 
     return fallback_succeeded
 
@@ -882,18 +1008,258 @@ def process_download_jobs(
     print("\nStarting download process...")
     all_jobs_overall_success = True
     job_statuses: Dict[str, Dict[str, Any]] = {}
+    total_success = 0
+    total_failure = 0
+    total_skipped = 0
 
     for job_type, request_info, device_code, ext in jobs:
-        status_info: Dict[str, Any] = {'status': 'Unknown', 'reason': '', 'details': {}}
+        status_info: Dict[str, Any] = {
+            'status': 'Unknown',
+            'reason': '',
+            'details': {
+                'files_expected': 0,
+                'files_downloaded': 0,
+                'files_skipped': 0,
+                'files_failed': 0
+            }
+        }
         job_succeeded = False # Default to not succeeded
 
+        # === Handle Data Product Downloads (PNG, TXT, etc.) ===
+        if job_type == 'dataproduct':
+            request_id = request_info
+            job_status_key = f"Req_{request_id}_{device_code}_{ext}"
+            print(f"\n--- Processing {job_status_key} ---")
+            trigger_fallback = False
+            run_info = None
+            run_succeeded = False
+            job_status_final = 'UNKNOWN'
+            actual_run_id = None
+            files_dp_downloaded = 0
+            files_dp_skipped = 0
+            files_dp_failed = 0
+            files_dp_expected = -1
+
+            try:
+                # Step 1: Run and wait
+                logging.info(f"Running request ID {request_id}...")
+                try:
+                    run_info = onc_client.runDataProduct(request_id)
+                    utils.dbg("runDataProduct result:", run_info, args=args)
+                    
+                    # Parse run info - handle both old and new API response formats
+                    if isinstance(run_info, dict):
+                        # New format: direct access
+                        actual_run_id = run_info.get('dpRunId')
+                        if not actual_run_id and 'runIds' in run_info:
+                            # Handle older format where runId was in runIds array
+                            run_ids = run_info.get('runIds', [])
+                            if run_ids and len(run_ids) > 0:
+                                actual_run_id = run_ids[0]
+                        
+                        files_dp_expected = run_info.get('fileCount', -1)
+                        
+                        if actual_run_id:  # We have a valid run ID
+                            run_succeeded = True
+                            try:
+                                final_status_check = onc_client.checkDataProduct(request_id)
+                                final_onc_status = final_status_check.get('searchHdrStatus', '?') if isinstance(final_status_check, dict) else (final_status_check[0].get('searchHdrStatus', '?') if isinstance(final_status_check, list) and final_status_check else '?')
+                                final_onc_status = final_onc_status.upper()
+                                utils.dbg(f"Parsed final status: {final_onc_status}", args=args)
+
+                                if final_onc_status in ['COMPLETE', 'COMPLETED']:
+                                    if files_dp_expected == 0:
+                                        job_succeeded = True
+                                        status_info['status'] = 'Success'
+                                        status_info['reason'] = '0 Files Generated'
+                                        logging.info("  ONC reported 0 files generated.")
+                                    elif files_dp_expected > 0:
+                                        logging.info(f"  ONC reported {files_dp_expected} files generated.")
+                                    else:
+                                        logging.warning("  ONC reported invalid file count.")
+                                elif final_onc_status in ['FAILED', 'CANCELLED']:
+                                    status_info['status'] = 'Failed'
+                                    status_info['reason'] = f'ONC Status {final_onc_status}'
+                                    run_succeeded = False
+                                    logging.error(f"✖ Request {request_id} final status: {final_onc_status}.")
+                                else:
+                                    status_info['status'] = 'Failed'
+                                    status_info['reason'] = f'Unknown ONC Status {final_onc_status}'
+                                    run_succeeded = False
+                                    logging.warning(f"⚠ Request {request_id} unexpected final status: {final_onc_status}.")
+                            except Exception as status_err:
+                                logging.warning(f"⚠ Error checking status: {status_err}.")
+                                run_succeeded = False
+                                job_status_final = 'STATUS_CHECK_ERROR'
+                        else:
+                            logging.error("✖ Failed to get valid run ID from response.")
+                            run_succeeded = False
+                            job_status_final = 'INVALID_RUN_INFO'
+                    else:
+                        logging.error("✖ Invalid response format from runDataProduct.")
+                        run_succeeded = False
+                        job_status_final = 'INVALID_RESPONSE'
+                except requests.exceptions.HTTPError as http_err:
+                    err_text = str(http_err).lower()
+                    if http_err.response is not None and http_err.response.status_code == 400 and ("api error 71" in err_text or "permissions not granted" in err_text):
+                        status_info['status'] = 'Skipped'
+                        status_info['reason'] = 'Permissions Error (API 71)'
+                        logging.warning(f"⚠ {job_status_key}: Skipped due to permissions.")
+                        job_succeeded = True  # Consider permission skips as "success"
+                    else:
+                        status_info['status'] = 'Failed'
+                        status_info['reason'] = 'Run Step HTTP Error'
+                        logging.error(f"✖ {job_status_key}: HTTP error during run: {http_err}")
+                    run_succeeded = False
+                    job_status_final = 'RUN_ERROR'
+                except Exception as run_err:
+                    logging.error(f"✖ Error running request {request_id}: {run_err}", exc_info=args.debug)
+                    run_succeeded = False
+                    job_status_final = 'RUN_ERROR'
+
+                # Step 2: Download data product
+                if run_succeeded and not job_succeeded:
+                    if actual_run_id is None:
+                        logging.error("✖ Cannot download: Run ID unknown.")
+                        status_info['status'] = 'Failed'
+                        status_info['reason'] = 'Missing Run ID'
+                    else:
+                        # Add longer wait for MAT/PDF files
+                        needs_longer_wait = ext.lower() in ('mat', 'pdf')
+                        wait_before_download = 10 if needs_longer_wait else 5
+                        logging.info(f"Waiting {wait_before_download}s...")
+                        time.sleep(wait_before_download)
+                        logging.info(f"Attempting download for runId {actual_run_id}...")
+                        try:
+                            # Increase retries for MAT/PDF files
+                            max_retries = 5 if needs_longer_wait else 3
+                            dl_args = dict(
+                                runId=actual_run_id,
+                                maxRetries=max_retries,
+                                downloadResultsOnly=False,
+                                includeMetadataFile=False,
+                                overwrite=args.yes
+                            )
+                            # Temporarily increase client timeout for MAT/PDF files
+                            original_timeout = onc_client.timeout
+                            if needs_longer_wait:
+                                onc_client.timeout = 300  # 5 minutes for MAT/PDF files
+                            try:
+                                dl_result = onc_client.downloadDataProduct(**dl_args)
+                            finally:
+                                # Restore original timeout
+                                onc_client.timeout = original_timeout
+
+                            if isinstance(dl_result, list):
+                                if not dl_result and files_dp_expected == 0:
+                                    job_succeeded = True
+                                    status_info['status'] = 'Success'
+                                    status_info['reason'] = '0 Files Generated (Confirmed)'
+                                    files_dp_downloaded = 0
+                                    files_dp_skipped = 0
+                                elif not dl_result:
+                                    trigger_fallback = True
+                                    logging.warning(f"⚠ DL empty but {files_dp_expected} files expected.")
+                                else:
+                                    # Analyze results
+                                    succ = [item for item in dl_result if isinstance(item, dict) and (str(item.get('status','')).lower() == 'complete' or item.get('downloaded') is True)]
+                                    errs = [item for item in dl_result if isinstance(item, dict) and 'error' in str(item.get('status','')).lower()]
+                                    skip = [item for item in dl_result if isinstance(item, dict) and str(item.get('status','')).lower() == 'skipped']
+                                    files_dp_downloaded = len(succ)
+                                    files_dp_skipped = len(skip)
+                                    files_dp_failed = len(errs)
+                                    
+                                    # If a file was skipped, consider it a success
+                                    if files_dp_skipped > 0:
+                                        files_dp_downloaded = 0
+                                        job_succeeded = True
+                                        status_info['status'] = 'Success'
+                                        status_info['reason'] = 'Files Already Exist'
+                                        logging.info(f"✔ All files already exist, skipped {files_dp_skipped} file(s).")
+                                    elif files_dp_failed > 0:
+                                        logging.error(f"✖ DL had {files_dp_failed} error(s).")
+                                        trigger_fallback = True
+                                    elif files_dp_downloaded > 0:
+                                        job_succeeded = True
+                                        status_info['status'] = 'Success'
+                                        logging.info(f"✔ Successfully downloaded {files_dp_downloaded} file(s).")
+                                    else:
+                                        trigger_fallback = True
+                                        logging.warning("⚠ DL status unclear.")
+                            else:
+                                trigger_fallback = True
+                                logging.warning("⚠ DL returned unexpected type.")
+                        except Exception as dl_err:
+                            logging.error(f"✖ DL Error: {dl_err}", exc_info=args.debug)
+                            trigger_fallback = True
+
+                # Step 3: Fallback for data products if needed
+                if trigger_fallback and not job_succeeded:
+                    if actual_run_id is None:
+                        logging.error("Cannot fallback: Run ID unknown.")
+                    else:
+                        logging.info(f"Checking status again before fallback for {request_id}...")
+                        final_status_fb = 'UNKNOWN'
+                        try:
+                            fb_stat = onc_client.checkDataProduct(request_id)
+                            final_status_fb = fb_stat.get('searchHdrStatus','?') if isinstance(fb_stat,dict) else (fb_stat[0].get('searchHdrStatus','?') if isinstance(fb_stat,list) and fb_stat else '?')
+                            final_status_fb = final_status_fb.upper()
+                        except Exception as e:
+                            logging.warning(f"Fallback status check failed: {e}")
+
+                        if final_status_fb in ['COMPLETE', 'COMPLETED']:
+                            logging.info(f"Proceeding with fallback for {request_id} (runId {actual_run_id}).")
+                            # For MAT/PDF files, add extra wait before fallback
+                            needs_longer_wait = ext.lower() in ('mat', 'pdf')
+                            if needs_longer_wait:
+                                extra_wait = 15
+                                logging.info(f"Adding extra {extra_wait}s wait before fallback for {ext.upper()} file...")
+                                time.sleep(extra_wait)
+
+                            fallback_success = _attempt_fallback_download(request_id, actual_run_id, device_code, ext, onc_client, args, run_info)
+                            job_succeeded = fallback_success
+                            status_info['status'] = 'Success' if fallback_success else 'Failed'
+                            status_info['reason'] = 'Fallback Attempted' + (' (Succeeded/Partial)' if fallback_success else ' (Failed)')
+                            # Update counts based on fallback result
+                            if fallback_success:
+                                files_dp_downloaded = files_dp_expected  # Assume all files were downloaded
+                                files_dp_failed = 0
+                            else:
+                                files_dp_failed = files_dp_expected
+                                files_dp_downloaded = 0
+                        else:
+                            logging.warning(f"Skipping fallback; status '{final_status_fb}', not COMPLETE.")
+
+                # Final status determination
+                if not job_succeeded and status_info['status'] not in ['Skipped', 'Failed']:
+                    status_info['status'] = 'Failed'
+                    if not status_info['reason']:
+                        status_info['reason'] = f'Processing Failed (ONC Status: {job_status_final})' if job_status_final != 'UNKNOWN' else 'Processing Failed'
+
+            except Exception as job_err:
+                logging.error(f"Unexpected error processing DP request {request_id}: {job_err}", exc_info=True)
+                status_info['status'] = 'Failed'
+                status_info['reason'] = 'Unexpected Processing Error'
+
+            # Update status info with file counts
+            status_info['details'] = {
+                'files_expected': files_dp_expected,
+                'files_downloaded': files_dp_downloaded,
+                'files_skipped': files_dp_skipped,
+                'files_failed': files_dp_failed
+            }
+
         # === Handle Archive File Downloads (e.g., if WAV fallback to archive is needed) ===
-        if job_type == 'archive':
+        elif job_type == 'archive':
             job_status_key = f"Archive_{device_code}_{ext}"
             print(f"\n--- Processing {job_status_key} ---")
             archive_filters = request_info
-            files_found = 0; files_existing = 0; files_skipped = 0
-            files_downloaded = 0; files_failed = 0; listing_failed = False
+            files_found = 0
+            files_existing = 0
+            files_skipped = 0
+            files_downloaded = 0
+            files_failed = 0
+            listing_failed = False
             try:
                 # 1. List files
                 logging.info(f"Listing potential archive files...")
@@ -962,10 +1328,13 @@ def process_download_jobs(
                             total_size += ext_size
                             print(f"Total {ext.upper()} size: {utils.human_size(ext_size)}")
                         
+                        print("\n" + "-" * 100)
+                        print(f"Total size of all files: {utils.human_size(total_size)}")
+                        print("-" * 100)
+                        
                         # Set success for test mode since we listed files
                         job_succeeded = True
                         status_info['status'] = 'Success'
-                        status_info['reason'] = 'Files Listed (Test Mode)'
                         status_info['details']['total_size'] = total_size
                         continue # Skip to next job in test mode
 
@@ -1026,9 +1395,13 @@ def process_download_jobs(
                                     bar='#'*int(percent/5)+'-'*(20-int(percent/5))
                                     print(f"DL [{bar}] {i+1}/{total_dl}", end='\r')
                             print("\nDL loop finished.")
-                        if files_failed == 0: 
+                        
+                        # Consider job successful if we either downloaded files or skipped them all
+                        if files_failed == 0 or files_skipped == files_found: 
                             job_succeeded = True
                             status_info['status'] = 'Success'
+                            if files_skipped == files_found:
+                                status_info['reason'] = 'All Files Already Exist'
                         else: 
                             job_succeeded = False
                             status_info['status'] = 'Failed'
@@ -1042,204 +1415,46 @@ def process_download_jobs(
                 job_succeeded = False
                 status_info['status'] = 'Failed'
                 status_info['reason'] = 'Unexpected Error'
-            status_info['details'] = {'found': files_found, 'skipped': files_skipped, 'downloaded': files_downloaded, 'failed': files_failed}
-            print(f"{'✅' if job_succeeded else '❌'} {job_status_key} - Status: {status_info['status']}" + (f" ({status_info['reason']})" if status_info['reason'] else ""))
+            status_info['details'] = {
+                'files_expected': files_found,
+                'files_downloaded': files_downloaded,
+                'files_skipped': files_skipped,
+                'files_failed': files_failed
+            }
 
-        # === Handle HDP Audio Order (New Logic for WAV) ===
-        elif job_type == 'order_hdp':
-            job_status_key = f"OrderHDP_{device_code}_{ext}"
-            print(f"\n--- Processing {job_status_key} ---")
-            hdp_params = request_info # Parameters prepared in request_onc_jobs
-            downloaded_zip_path = None
-            extracted_files_count = 0
-            try:
-                logging.info(f"Ordering HDP data product...")
-                utils.dbg("Args for onc.orderDataProduct:", hdp_params, args=args)
-                # Use args.yes for overwrite flag for the downloaded zip
-                order_result = onc_client.orderDataProduct(
-                    filters=hdp_params,
-                    includeMetadataFile=False,
-                    overwrite=args.yes
-                )
-                utils.dbg(f"orderDataProduct result:", order_result, args=args)
-
-                # Check result and find downloaded ZIP file
-                zip_file_info = None
-                if isinstance(order_result, dict) and 'downloadResults' in order_result:
-                    for item in order_result.get('downloadResults', []):
-                        if isinstance(item, dict) and item.get('downloaded') is True and str(item.get('file', '')).lower().endswith('.zip'):
-                            zip_file_info = item
-                            break # Found the downloaded zip
-
-                if zip_file_info:
-                    zip_filename = zip_file_info.get('file')
-                    zip_path = output_path / zip_filename
-                    downloaded_zip_path = zip_path # Store path for details
-                    logging.info(f"HDP order successful. Downloaded ZIP: {zip_filename} ({utils.human_size(zip_file_info.get('size', 0))})")
-
-                    # Unzip the file
-                    logging.info(f"Extracting {zip_filename} to {output_path}...")
-                    try:
-                        with zipfile.ZipFile(zip_path, 'r') as zip_ref:
-                            member_list = zip_ref.namelist()
-                            extracted_files_count = len(member_list)
-                            zip_ref.extractall(output_path)
-                        logging.info(f"Successfully extracted {extracted_files_count} file(s) from {zip_filename}.")
-                        job_succeeded = True
-                        status_info['status'] = 'Success'
-                        # Optionally delete zip file after extraction
-                        # if args.delete_zip: # Example if adding a flag
-                        #     try: zip_path.unlink(); logging.info(f"Deleted {zip_filename}.")
-                        #     except OSError as e: logging.warning(f"Could not delete zip file {zip_filename}: {e}")
-                    except zipfile.BadZipFile:
-                        logging.error(f"✖ Failed to extract {zip_filename}: Invalid ZIP file.")
-                        status_info['status'] = 'Failed'; status_info['reason'] = 'Bad ZIP File'
-                    except FileNotFoundError:
-                        logging.error(f"✖ Failed to extract {zip_filename}: ZIP file not found at {zip_path}.")
-                        status_info['status'] = 'Failed'; status_info['reason'] = 'ZIP File Not Found'
-                    except Exception as zip_err:
-                        logging.error(f"✖ Failed to extract {zip_filename}: {zip_err}", exc_info=args.debug)
-                        status_info['status'] = 'Failed'; status_info['reason'] = 'Extraction Error'
-                else:
-                    # orderDataProduct completed but didn't return a downloaded zip file entry
-                    logging.error(f"✖ HDP order completed but no downloaded ZIP file information found in result.")
-                    status_info['status'] = 'Failed'; status_info['reason'] = 'No ZIP Info in Result'
-
-            except requests.exceptions.HTTPError as http_err: # Catch errors during orderDataProduct
-                err_text = str(http_err).lower() if http_err.response else ""
-                if http_err.response is not None and http_err.response.status_code == 400 and ("api error 71" in err_text or "permissions not granted" in err_text):
-                    status_info['status'] = 'Skipped'; status_info['reason'] = 'Permissions Error (API 71)'; logging.warning(f"⚠ {job_status_key}: Skipped HDP order due to permissions.")
-                else: status_info['status'] = 'Failed'; status_info['reason'] = 'Order Step HTTP Error'; logging.error(f"✖ {job_status_key}: HTTP error during HDP order: {http_err}")
-            except Exception as order_err: # Catch other errors during orderDataProduct
-                logging.error(f"✖ Unexpected error during HDP order for {device_code}: {order_err}", exc_info=args.debug)
-                status_info['status'] = 'Failed'; status_info['reason'] = 'Unexpected Order Error'
-
-            # Store HDP results details
-            status_info['details'] = {'zip_file': downloaded_zip_path.name if downloaded_zip_path else None, 'extracted_count': extracted_files_count}
-            print(f"{'✅' if job_succeeded else ('⚠️' if status_info['status'] == 'Skipped' else '❌')} {job_status_key} - Status: {status_info['status']}" + (f" ({status_info['reason']})" if status_info['reason'] else ""))
-
-        # === Handle Data Product Downloads (PNG, TXT) ===
-        elif job_type == 'dataproduct':
-            request_id = request_info
-            job_status_key = f"Req_{request_id}_{device_code}_{ext}"
-            print(f"\n--- Processing {job_status_key} ---")
-            trigger_fallback = False; run_info = None; run_succeeded = False
-            job_status_final = 'UNKNOWN'; actual_run_id = None
-            files_dp_downloaded = 0; files_dp_skipped = 0; files_dp_expected = -1
-            try:
-                # Step 1: Run and wait
-                logging.info(f"Running request ID {request_id}...")
-                try:
-                    run_info = onc_client.runDataProduct(dpRequestId=request_id, waitComplete=True)
-                    run_succeeded = True
-                except requests.exceptions.HTTPError as http_err:
-                    run_succeeded = False
-                    job_status_final = 'FAILED_ON_RUN'
-                    err_text = str(http_err).lower()
-                    if http_err.response is not None and http_err.response.status_code == 400 and ("api error 71" in err_text or "permissions not granted" in err_text):
-                        status_info['status'] = 'Skipped'
-                        status_info['reason'] = 'Permissions Error (API 71)'
-                        logging.warning(f"⚠ {job_status_key}: Skipped due to permissions.")
-                    else:
-                        status_info['status'] = 'Failed'
-                        status_info['reason'] = 'Run Step HTTP Error'
-                        logging.error(f"✖ {job_status_key}: HTTP error during run: {http_err}")
-                except Exception as run_err:
-                    run_succeeded = False
-                    job_status_final = 'FAILED_ON_RUN'
-                    status_info['status'] = 'Failed'
-                    status_info['reason'] = 'Run Step Exception'
-                    logging.error(f"✖ {job_status_key}: Unexpected error during run: {run_err}", exc_info=args.debug)
-
-                # Step 1b: Validate run / Check status
-                final_onc_status = 'UNKNOWN'
-                if run_succeeded:
-                    if isinstance(run_info, dict) and run_info.get('runIds'):
-                        actual_run_id = run_info['runIds'][0]; files_dp_expected = run_info.get('fileCount', -1)
-                        try:
-                            status_check = onc_client.checkDataProduct(request_id); status_data = None
-                            if isinstance(status_check, dict): status_data = status_check
-                            elif isinstance(status_check, list) and status_check: status_data = status_check[0]
-                            if status_data: final_onc_status = status_data.get('searchHdrStatus', 'UNKNOWN').upper()
-                            else: final_onc_status = 'CHECK_FAILED'
-                            job_status_final = final_onc_status; utils.dbg(f"Parsed final status: {job_status_final}", args=args)
-                            if final_onc_status in ['COMPLETE', 'COMPLETED']:
-                                if files_dp_expected == 0: job_succeeded = True; status_info['status'] = 'Success'; status_info['reason'] = '0 Files Generated'; logging.info("  ONC reported 0 files generated.")
-                                elif files_dp_expected > 0: logging.info(f"  ONC reported {files_dp_expected} files generated.")
-                                else: logging.warning("  ONC reported invalid file count.")
-                            elif final_onc_status in ['FAILED', 'CANCELLED']: status_info['status'] = 'Failed'; status_info['reason'] = f'ONC Status {final_onc_status}'; run_succeeded = False; logging.error(f"✖ Request {request_id} final status: {final_onc_status}.")
-                            else: status_info['status'] = 'Failed'; status_info['reason'] = f'Unknown ONC Status {final_onc_status}'; run_succeeded = False; logging.warning(f"⚠ Request {request_id} unexpected final status: {final_onc_status}.")
-                        except Exception as status_err: logging.warning(f"⚠ Error checking status: {status_err}."); run_succeeded = False; job_status_final = 'STATUS_CHECK_ERROR'
-                    else: logging.error("✖ Failed to get valid run info."); run_succeeded = False; job_status_final = 'INVALID_RUN_INFO'
-
-                # Step 2: Download data product
-                if run_succeeded and not job_succeeded:
-                     if actual_run_id is None: logging.error("✖ Cannot download: Run ID unknown."); status_info['status'] = 'Failed'; status_info['reason'] = 'Missing Run ID'
-                     else:
-                        wait_before_download = 5; logging.info(f"Waiting {wait_before_download}s..."); time.sleep(wait_before_download)
-                        logging.info(f"Attempting download for runId {actual_run_id}...")
-                        try:
-                            dl_args = dict(runId=actual_run_id, maxRetries=3, downloadResultsOnly=False, includeMetadataFile=False, overwrite=args.yes)
-                            dl_result = onc_client.downloadDataProduct(**dl_args)
-                            if isinstance(dl_result, list):
-                                if not dl_result and files_dp_expected == 0: job_succeeded = True; status_info['status'] = 'Success'; status_info['reason'] = '0 Files Generated (Confirmed)'; files_dp_downloaded = 0; files_dp_skipped = 0
-                                elif not dl_result: trigger_fallback = True; logging.warning(f"⚠ DL empty but {files_dp_expected} files expected.")
-                                else: # Analyze results
-                                    succ = [item for item in dl_result if isinstance(item, dict) and (str(item.get('status','')).lower() == 'complete' or item.get('downloaded') is True)]
-                                    errs = [item for item in dl_result if isinstance(item, dict) and 'error' in str(item.get('status','')).lower()]
-                                    skip = [item for item in dl_result if isinstance(item, dict) and str(item.get('status','')).lower() == 'skipped']
-                                    files_dp_downloaded = len(succ); files_dp_skipped = len(skip)
-                                    if len(errs) > 0: logging.error(f"✖ DL had {len(errs)} error(s)."); trigger_fallback = True
-                                    elif files_dp_downloaded > 0 or files_dp_skipped > 0: job_succeeded = True; status_info['status'] = 'Success'; logging.info(f"✔ DL successful/skipped {files_dp_downloaded}/{files_dp_skipped} files.")
-                                    else: trigger_fallback = True; logging.warning("⚠ DL status unclear.")
-                            else: trigger_fallback = True; logging.warning("⚠ DL returned unexpected type.")
-                        except Exception as dl_err: logging.error(f"✖ DL Error: {dl_err}", exc_info=args.debug); trigger_fallback = True
-
-                # Step 3: Fallback for data products if needed
-                if trigger_fallback and not job_succeeded:
-                    if actual_run_id is None: logging.error("Cannot fallback: Run ID unknown.")
-                    else:
-                        # ... (Fallback logic as before) ...
-                        logging.info(f"Checking status again before fallback for {request_id}...")
-                        final_status_fb = 'UNKNOWN';
-                        try: fb_stat=onc_client.checkDataProduct(request_id); final_status_fb=fb_stat.get('searchHdrStatus','?') if isinstance(fb_stat,dict) else (fb_stat[0].get('searchHdrStatus','?') if isinstance(fb_stat,list) and fb_stat else '?'); final_status_fb=final_status_fb.upper()
-                        except Exception as e: logging.warning(f"Fallback status check failed: {e}")
-                        if final_status_fb in ['COMPLETE', 'COMPLETED']:
-                            logging.info(f"Proceeding with fallback for {request_id} (runId {actual_run_id}).")
-                            fallback_success = _attempt_fallback_download(request_id, actual_run_id, device_code, ext, onc_client, args, run_info)
-                            job_succeeded = fallback_success
-                            status_info['status'] = 'Success' if fallback_success else 'Failed'
-                            status_info['reason'] = 'Fallback Attempted' + (' (Succeeded/Partial)' if fallback_success else ' (Failed)')
-                            files_dp_downloaded = None; files_dp_skipped = None # Fallback doesn't provide counts
-                        else: logging.warning(f"Skipping fallback; status '{final_status_fb}', not COMPLETE.")
-
-                # Final status determination
-                if not job_succeeded and status_info['status'] not in ['Skipped', 'Failed']:
-                    status_info['status'] = 'Failed'
-                    if not status_info['reason']: status_info['reason'] = f'Processing Failed (ONC Status: {job_status_final})' if job_status_final != 'UNKNOWN' else 'Processing Failed'
-
-            except Exception as job_err: logging.error(f"Unexpected error processing DP request {request_id}: {job_err}", exc_info=True); status_info['status'] = 'Failed'; status_info['reason'] = 'Unexpected Processing Error'
-
-            # Store final DP status details
-            status_info['details'] = {'onc_status': job_status_final, 'run_id': actual_run_id, 'files_expected': files_dp_expected, 'downloaded': files_dp_downloaded, 'skipped': files_dp_skipped}
-            print(f"{'✅' if job_succeeded else ('⚠️' if status_info['status'] == 'Skipped' else '❌')} {job_status_key} - Status: {status_info['status']}" + (f" ({status_info['reason']})" if status_info['reason'] else ""))
-
-
-        # === Unknown Job Type ===
-        else:
-             job_status_key = f"Unknown_{job_type}_{device_code}_{ext}"
-             logging.error(f"Unknown job type '{job_type}' encountered.");
-             status_info['status'] = 'Failed'; status_info['reason'] = 'Unknown Job Type'
-
-        # --- Store final status and update overall success ---
+        # Store job status and update overall success
         job_statuses[job_status_key] = status_info
-        if status_info['status'] == 'Failed': all_jobs_overall_success = False
+        if status_info['status'] == 'Failed':
+            all_jobs_overall_success = False
+            total_failure += 1
+        elif status_info['status'] == 'Skipped':
+            total_skipped += 1
+        else:
+            total_success += 1
 
-        # --- Common debug listing ---
-        if args.debug_net:
-            proc_id = request_info if job_type != 'archive' else f"Archive_{device_code}_{ext}" # Adjust ID for logging
-            print(f"--- Contents of '{output_path}' after processing {proc_id} ---")
-            utils.list_tree(output_path, args=args); print("-" * (58 + len(str(proc_id))))
+    # Print final summary
+    print("\n==============================")
+    print("Processing Summary:")
+    print("------------------------------")
+    for job_key, info in job_statuses.items():
+        status_emoji = '✅' if info['status'] == 'Success' else ('⚠️' if info['status'] == 'Skipped' else '❌')
+        print(f"{status_emoji} {job_key}: {info['status']}" + (f" ({info['reason']})" if info['reason'] else ""))
+        details = info['details']
+        if details:
+            counts_str = []
+            if details['files_expected'] >= 0:
+                counts_str.append(f"Files Expected: {details['files_expected']}")
+                if details['files_skipped'] > 0:
+                    counts_str.append(f"Skipped (Already Exist): {details['files_skipped']}")
+                elif details['files_downloaded'] > 0:
+                    counts_str.append(f"Downloaded: {details['files_downloaded']}")
+                if details['files_failed'] > 0:
+                    counts_str.append(f"Failed: {details['files_failed']}")
+            if counts_str:
+                print(f"     └─ {', '.join(counts_str)}")
 
-    # --- End Job Loop ---
+    print("------------------------------")
+    print(f"⚠ Processing finished with {total_success} success(es), {total_failure} failure(s), {total_skipped} skipped.")
+    print(f"Downloaded files location: {output_path}")
+
     return all_jobs_overall_success, job_statuses
