@@ -37,12 +37,14 @@ try:
 except ImportError:
     COLAB_ENV = False
 
-# Import FileChooser
+# Import FileChooser and its utilities
 try:
     from ipyfilechooser import FileChooser
+    from ipyfilechooser.utils import InvalidPathError
     FILECHOOSER_AVAILABLE = True
 except ImportError:
     FileChooser = None
+    InvalidPathError = None
     FILECHOOSER_AVAILABLE = False
     print("WARNING: 'ipyfilechooser' not found. Drive folder picker will not be available. Install with: pip install ipyfilechooser", file=sys.stderr)
 
@@ -105,18 +107,8 @@ w_download_target = widgets.RadioButtons(
 )
 w_colab_path = widgets.Text(description="Colab Path:", value="downloads", layout=widgets.Layout(width='auto', min_width='300px'))
 
-# Initialize FileChooser or fallback widget
-w_drive_folder_picker = None
-if FILECHOOSER_AVAILABLE:
-    w_drive_folder_picker = FileChooser(DRIVE_MYDRIVE_PATH)
-    w_drive_folder_picker.title = '<b>Select Google Drive Destination Folder</b>'
-    w_drive_folder_picker.show_only_dirs = True
-    w_drive_folder_picker.layout.display = 'none'  # Initially hidden
-else:
-    w_drive_folder_picker = widgets.HTML(
-        "<i style='color:red'>ipyfilechooser not installed. Cannot select Drive folder.</i>",
-        layout=widgets.Layout(display='none')
-    )
+# Container for Drive-related widgets
+w_download_drive_container = widgets.VBox([], layout=widgets.Layout(width='95%'))
 
 w_drive_mount_instruct = widgets.HTML(value="""
 <div style="margin-top: 5px; font-size: small; color: grey;">
@@ -126,23 +118,11 @@ w_drive_mount_instruct = widgets.HTML(value="""
 </div>
 """, layout=widgets.Layout(display='none'))
 
-# Fallback widgets for when FileChooser isn't available
-w_drive_widget_placeholder = widgets.HTML("<b>Enter Google Drive Path:</b>")
-w_drive_path_manual = widgets.Text(
-    description="Drive Path:",
-    value="",
-    placeholder="/content/drive/MyDrive/downloads",
-    layout=widgets.Layout(width='auto', min_width='300px', display='none')
-)
-
-# Container for Drive-related widgets
-w_download_drive_container = widgets.VBox([], layout=widgets.Layout(width='95%'))
-
 # Group download location widgets
 w_download_location_box = widgets.VBox([
     w_download_target,
     w_colab_path,
-    w_drive_folder_picker,
+    w_download_drive_container,
     w_drive_mount_instruct
 ])
 # --- End Download Location Widgets ---
@@ -361,8 +341,9 @@ def _toggle_widgets(disabled: bool):
                 w.disabled = disabled
 
     # Also disable FileChooser when processing
-    if FILECHOOSER_AVAILABLE and isinstance(w_drive_folder_picker, FileChooser):
-        w_drive_folder_picker.disabled = disabled
+    fc_instance = state.get("drive_file_chooser_instance")
+    if FILECHOOSER_AVAILABLE and isinstance(fc_instance, FileChooser):
+        fc_instance.disabled = disabled
 
 def _build_product_selection_ui(available_products):
     """Dynamically creates product selection widgets (Checkboxes in Accordion)."""
@@ -524,9 +505,10 @@ def on_discover_button_clicked(b):
             target_type = w_download_target.value
             output_dir = None  # Initialize
             if target_type == 'Google Drive':
-                # Check if ipyfilechooser is available and a path is selected
-                if FILECHOOSER_AVAILABLE and isinstance(w_drive_folder_picker, FileChooser):
-                    selected_drive_path = w_drive_folder_picker.selected_path
+                # Check if FileChooser instance exists and has a path selected
+                fc_instance = state.get("drive_file_chooser_instance")
+                if FILECHOOSER_AVAILABLE and isinstance(fc_instance, FileChooser):
+                    selected_drive_path = fc_instance.selected_path
                     if not selected_drive_path:
                         show_status("✖ Google Drive selected, but no folder chosen in the picker.", target='discover', error=True)
                         _toggle_widgets(False); _set_button_state(w_discover_btn, working=False); return
@@ -537,8 +519,17 @@ def on_discover_button_clicked(b):
                     # Use the path selected by the user
                     output_dir = selected_drive_path
                 else:  # FileChooser not available or failed
-                    show_status("✖ Google Drive selected, but FileChooser widget is not available.", target='discover', error=True)
-                    _toggle_widgets(False); _set_button_state(w_discover_btn, working=False); return
+                    # Try to get path from manual input if present
+                    if w_download_drive_container.children and isinstance(w_download_drive_container.children[-1], widgets.VBox):
+                        manual_input = w_download_drive_container.children[-1].children[-1]
+                        if isinstance(manual_input, widgets.Text) and manual_input.value.strip():
+                            output_dir = manual_input.value.strip()
+                        else:
+                            show_status("✖ Please enter a valid Google Drive path.", target='discover', error=True)
+                            _toggle_widgets(False); _set_button_state(w_discover_btn, working=False); return
+                    else:
+                        show_status("✖ No valid Google Drive path input method available.", target='discover', error=True)
+                        _toggle_widgets(False); _set_button_state(w_discover_btn, working=False); return
             else:  # Colab Environment
                 output_dir = w_colab_path.value.strip() or 'downloads'
 
@@ -857,30 +848,43 @@ def on_download_target_change(change):
         w_colab_path.layout.display = 'none'
         w_drive_mount_instruct.layout.display = 'block'
         
-        # Conditionally create/show FileChooser or fallback
+        # Handle Google Drive selection
         if FILECHOOSER_AVAILABLE:
-            # Create instance only if needed and not already created
-            if state.get("drive_file_chooser_instance") is None:
-                # Check if Drive is mounted BEFORE creating FileChooser
-                if COLAB_ENV and os.path.isdir(DRIVE_MYDRIVE_PATH):
-                    fc = FileChooser(DRIVE_MYDRIVE_PATH)  # Start in MyDrive
-                    fc.title = '<b>Select Google Drive Destination Folder</b>'
-                    fc.show_only_dirs = True
-                    state["drive_file_chooser_instance"] = fc
-                    w_download_drive_container.children = [fc]  # Add instance to container
-                else:
-                    # Drive not mounted, show message instead of picker
-                    drive_not_mounted_msg = widgets.HTML(
-                        "<i style='color:orange'>Mount Google Drive first to enable folder picker.</i>"
+            # Check if Drive is mounted before attempting to create FileChooser
+            if COLAB_ENV and os.path.isdir(DRIVE_MYDRIVE_PATH):
+                try:
+                    # Create new FileChooser instance if needed
+                    if state.get("drive_file_chooser_instance") is None:
+                        fc = FileChooser(DRIVE_MYDRIVE_PATH)
+                        fc.title = '<b>Select Google Drive Destination Folder</b>'
+                        fc.show_only_dirs = True
+                        state["drive_file_chooser_instance"] = fc
+                    # Show the existing or new instance
+                    w_download_drive_container.children = [state["drive_file_chooser_instance"]]
+                except InvalidPathError:
+                    # Handle path validation error
+                    error_msg = widgets.HTML(
+                        "<i style='color:red'>Error accessing Google Drive path. Please ensure Drive is mounted correctly.</i>"
                     )
-                    w_download_drive_container.children = [drive_not_mounted_msg]
+                    w_download_drive_container.children = [error_msg]
             else:
-                # Instance already exists, just ensure it's visible
-                w_download_drive_container.children = [state["drive_file_chooser_instance"]]
+                # Drive not mounted, show message
+                mount_msg = widgets.HTML(
+                    "<i style='color:orange'>Mount Google Drive first to enable folder picker.</i>"
+                )
+                w_download_drive_container.children = [mount_msg]
         else:
-            # FileChooser not installed, show fallback manual input
-            w_download_drive_container.children = [w_drive_widget_placeholder, w_drive_path_manual]
-            w_drive_path_manual.layout.display = 'flex'  # Show manual input
+            # FileChooser not available, show manual input option
+            manual_input = widgets.VBox([
+                widgets.HTML("<b>Enter Google Drive Path:</b>"),
+                widgets.Text(
+                    description="Drive Path:",
+                    value="",
+                    placeholder="/content/drive/MyDrive/downloads",
+                    layout=widgets.Layout(width='auto', min_width='300px')
+                )
+            ])
+            w_download_drive_container.children = [manual_input]
     else:  # Colab Environment
         w_colab_path.layout.display = 'flex'
         w_download_drive_container.children = []  # Hide drive options
