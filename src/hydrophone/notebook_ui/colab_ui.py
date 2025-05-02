@@ -129,9 +129,9 @@ w_download_location_box = widgets.VBox([
 
 # Mode & Options Widgets
 w_mode = widgets.RadioButtons(
-    options=['Data Product', 'Archive/Test'],
+    options=['Request New Data Product', 'Request Archived Data'],
     description='Mode:',
-    value='Data Product',
+    value='Request New Data Product',
     layout={'width': 'max-content'}
 )
 w_fetch_sensitivity = widgets.Checkbox(value=False, description='Fetch Sensitivity')
@@ -297,7 +297,7 @@ def _toggle_widgets(disabled: bool):
     # Determine if selections are complete enough to potentially enable download
     selections_ready = False
     if state.get("chosen_deployments"):  # Must have deployments selected
-        is_archive = (w_mode.value == 'Archive/Test')
+        is_archive = (w_mode.value == 'Archive')
         if is_archive:
             # Archive mode: Ready if archive checkboxes dict *exists* (UI was built)
             selections_ready = state.get("archive_checkboxes") is not None  # Check existence, not emptiness
@@ -539,7 +539,7 @@ def on_discover_button_clicked(b):
             # --- End get download path ---
 
             tz_str = w_tz.value
-            is_archive = (w_mode.value == 'Archive/Test'); is_test = is_archive
+            is_archive = (w_mode.value == 'Archive'); is_test = is_archive
             start_dt = _get_datetime_from_widgets(w_start_hbox.children[0], w_start_hbox.children[2], w_tz) # Get from HBox children
             end_dt = _get_datetime_from_widgets(w_end_hbox.children[0], w_end_hbox.children[2], w_tz) # Get from HBox children
 
@@ -695,7 +695,7 @@ def on_device_selected(change):
     first_device_code = first_chosen_dep.get("deviceCode")
 
     # Fetch Products or List Archive Files
-    is_archive = (w_mode.value == 'Archive/Test')
+    is_archive = (w_mode.value == 'Archive')
     ui_widgets_to_add = []
 
     try:
@@ -764,7 +764,7 @@ def on_download_button_clicked(b):
             show_status("✖ State error: Discovery must complete successfully first.", target='download', error=True)
             _toggle_widgets(False); _set_button_state(w_download_btn, working=False); return
 
-        is_archive = (w_mode.value == 'Archive/Test')
+        is_archive = (w_mode.value == 'Archive')
         params['archive'] = is_archive
         # *** Override 'test' flag for the download step ***
         # If the user clicked the download button, they intend to download,
@@ -892,7 +892,7 @@ def on_download_target_change(change):
 
 # --- Mode Change Observer ---
 def on_mode_change(change):
-    """Handles mode changes between Data Product and Archive/Test."""
+    """Handles mode changes between Data Product and Archive."""
     w_product_selection_area.children = []
     w_archive_selection_area.children = []
     w_product_archive_label.value = ""
