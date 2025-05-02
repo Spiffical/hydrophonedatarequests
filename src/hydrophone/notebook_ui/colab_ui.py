@@ -431,7 +431,7 @@ def _build_archive_selection_ui(archive_files_info):
 
     return archive_widgets
 
-def _prepare_parent_location_choices(deployments, loc_map):
+def _prepare_parent_location_choices(deployments, loc_map, onc_service=None, start_dt=None, end_dt=None, is_archive=False):
     """Helper to group deployments and format choices for the location selector."""
     by_parent_loc = defaultdict(list)
     parent_codes_found = set()
@@ -450,6 +450,43 @@ def _prepare_parent_location_choices(deployments, loc_map):
     parent_loc_choices = []
     parent_choice_details = {}
     GENERIC_LOC_MAP_NAMES = {"Hydrophone Array - Box Type", "Underwater Network"}
+
+    # Check for available files if we're in archive mode
+    if is_archive and onc_service and start_dt and end_dt:
+        # Keep track of which locations have files
+        locations_with_files = set()
+        
+        for parent_code in sorted_parent_codes:
+            deployments_at_parent = by_parent_loc[parent_code]
+            # Check each device at this location
+            for dep in deployments_at_parent:
+                device_code = dep.get('deviceCode')
+                if not device_code:
+                    continue
+                    
+                # Check if this device has any files
+                archive_filters = dict(
+                    deviceCode=device_code,
+                    dateFrom=utils.iso(start_dt.astimezone(UTC)),
+                    dateTo=utils.iso(end_dt.astimezone(UTC)),
+                    returnOptions='all'
+                )
+                try:
+                    list_result = onc_service.getArchivefile(filters=archive_filters, allPages=True)
+                    archive_files = list_result.get("files", [])
+                    if archive_files:
+                        # If we find any files, mark this location and break inner loop
+                        locations_with_files.add(parent_code)
+                        break
+                except Exception as e:
+                    logging.warning(f"Error checking files for device {device_code}: {e}")
+                    continue
+                    
+        # Update sorted_parent_codes to only include locations with files
+        if locations_with_files:
+            sorted_parent_codes = sorted(list(locations_with_files))
+        else:
+            sorted_parent_codes = []
 
     for parent_code in sorted_parent_codes:
         display_name = None
@@ -574,7 +611,7 @@ def on_discover_button_clicked(b):
             if not deployments: show_status("No overlapping deployments found.", target='discover', error=False); _toggle_widgets(False); _set_button_state(w_discover_btn, working=False); return
 
             # 4. Populate Location Selector
-            parent_choices, parent_codes, parent_details = _prepare_parent_location_choices(deployments, loc_map)
+            parent_choices, parent_codes, parent_details = _prepare_parent_location_choices(deployments, loc_map, onc_service, start_dt, end_dt, is_archive)
             state["parent_loc_choices"] = parent_choices; state["parent_loc_codes"] = parent_codes
             state["parent_choice_details"] = parent_details; w_location_select.options = parent_choices
             w_location_select.disabled = False; print("\n== Please select a Parent Location below ==")
@@ -629,17 +666,54 @@ def on_location_selected(change):
 
     # Populate device selector
     state["devices_at_selected_location"].clear()
-    device_options = ["ALL Hydrophones at this location"]
+    device_options = []
     sorted_device_codes = details['device_codes']
+    is_archive = (w_mode.value == 'Request Archived Data')
+    onc_service = state.get("onc_service")
+    all_params = state.get("all_params")
 
-    # Get device names
+    # Get device names and check for available files
     temp_device_names = {}
+    devices_with_files = set()
+    
     for dep in details['all_deployments']:
         d_code = dep.get('deviceCode')
         d_name = dep.get('deviceName', 'Unknown Device')
         if d_code and d_code not in temp_device_names:
             temp_device_names[d_code] = d_name
+            
+            # If in archive mode, check if this device has files
+            if is_archive and onc_service and all_params:
+                archive_filters = dict(
+                    deviceCode=d_code,
+                    dateFrom=utils.iso(all_params['start_dt'].astimezone(UTC)),
+                    dateTo=utils.iso(all_params['end_dt'].astimezone(UTC)),
+                    returnOptions='all'
+                )
+                try:
+                    list_result = onc_service.getArchivefile(filters=archive_filters, allPages=True)
+                    archive_files = list_result.get("files", [])
+                    if archive_files:
+                        devices_with_files.add(d_code)
+                except Exception as e:
+                    logging.warning(f"Error checking files for device {d_code}: {e}")
+                    continue
+    
     state["devices_at_selected_location"] = temp_device_names
+
+    # In archive mode, only show devices with files
+    if is_archive:
+        if devices_with_files:
+            if len(devices_with_files) > 1:
+                device_options.append("ALL Hydrophones at this location")
+            sorted_device_codes = sorted(list(devices_with_files))
+        else:
+            show_status("No devices found with available files.", target='discover', error=False)
+            _toggle_widgets(False)
+            return
+    else:
+        if len(sorted_device_codes) > 1:
+            device_options.append("ALL Hydrophones at this location")
 
     device_options.extend([f"{temp_device_names.get(code, 'Unknown')} ({code})" for code in sorted_device_codes])
 
