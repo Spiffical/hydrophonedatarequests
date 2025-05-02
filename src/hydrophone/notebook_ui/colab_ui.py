@@ -531,13 +531,13 @@ def on_discover_button_clicked(b):
                         show_status("✖ No valid Google Drive path input method available.", target='discover', error=True)
                         _toggle_widgets(False); _set_button_state(w_discover_btn, working=False); return
             else:  # Colab Environment
-                # Get the parent directory of the current workspace
-                parent_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-                # Use the specified path or default to 'downloads', but place it at parent level
+                # Get the current working directory (should be the repo root after %cd)
+                repo_root = os.getcwd()
+                # Use the specified path or default to 'downloads'
                 colab_path = w_colab_path.value.strip() or 'downloads'
-                # If path is relative, make it relative to parent directory
+                # If path is relative, make it relative to the parent of repo root
                 if not os.path.isabs(colab_path):
-                    output_dir = os.path.join(os.path.dirname(parent_dir), colab_path)
+                    output_dir = os.path.join(os.path.dirname(repo_root), colab_path)
                 else:
                     output_dir = colab_path
 
