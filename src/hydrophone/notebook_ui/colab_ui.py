@@ -217,7 +217,9 @@ state = {
     "archive_checkboxes": {},  # {ext: checkbox_widget}
     "chosen_deployments": [],
     "all_params": {},
-    "drive_file_chooser_instance": None  # Store the instance if created
+    "drive_file_chooser_instance": None,  # Store the instance if created
+    "preloaded_device_files": {},  # Store device file availability info: {device_code: has_files}
+    "preloaded_device_names": {}  # Store device names: {device_code: device_name}
 }
 
 # --- Helper Functions ---
@@ -455,15 +457,33 @@ def _prepare_parent_location_choices(deployments, loc_map, onc_service=None, sta
     if is_archive and onc_service and start_dt and end_dt:
         # Keep track of which locations have files
         locations_with_files = set()
+        state["preloaded_device_files"].clear()  # Clear previous preloaded data
+        state["preloaded_device_names"].clear()
+        
+        print("Pre-loading device information...")
+        total_devices = sum(len(set(dep.get('deviceCode') for dep in deps if dep.get('deviceCode'))) 
+                          for deps in by_parent_loc.values())
+        devices_checked = 0
         
         for parent_code in sorted_parent_codes:
             deployments_at_parent = by_parent_loc[parent_code]
             # Check each device at this location
+            checked_devices = set()  # Track devices we've already checked at this location
+            
             for dep in deployments_at_parent:
                 device_code = dep.get('deviceCode')
-                if not device_code:
+                device_name = dep.get('deviceName', 'Unknown Device')
+                
+                if not device_code or device_code in checked_devices:
                     continue
                     
+                checked_devices.add(device_code)
+                devices_checked += 1
+                print(f"\rChecking devices: {devices_checked}/{total_devices}", end="")
+                
+                # Store device name
+                state["preloaded_device_names"][device_code] = device_name
+                
                 # Check if this device has any files
                 archive_filters = dict(
                     deviceCode=device_code,
@@ -473,14 +493,16 @@ def _prepare_parent_location_choices(deployments, loc_map, onc_service=None, sta
                 )
                 try:
                     list_result = onc_service.getArchivefile(filters=archive_filters, allPages=True)
-                    archive_files = list_result.get("files", [])
-                    if archive_files:
-                        # If we find any files, mark this location and break inner loop
+                    has_files = bool(list_result.get("files", []))
+                    state["preloaded_device_files"][device_code] = has_files
+                    if has_files:
                         locations_with_files.add(parent_code)
-                        break
                 except Exception as e:
                     logging.warning(f"Error checking files for device {device_code}: {e}")
+                    state["preloaded_device_files"][device_code] = False
                     continue
+        
+        print("\nDevice information pre-loading complete.")
                     
         # Update sorted_parent_codes to only include locations with files
         if locations_with_files:
@@ -510,7 +532,14 @@ def _prepare_parent_location_choices(deployments, loc_map, onc_service=None, sta
 
         # Get Device List
         device_codes_only = set(dep.get('deviceCode') for dep in deployments_at_parent if dep.get('deviceCode'))
-        device_list_str = f" (Devs: {len(device_codes_only)})" if device_codes_only else ""
+        
+        # In archive mode, only count devices with files
+        if is_archive:
+            device_count = sum(1 for code in device_codes_only if state["preloaded_device_files"].get(code, False))
+        else:
+            device_count = len(device_codes_only)
+            
+        device_list_str = f" (Devs: {device_count})" if device_count else ""
 
         parent_choice_details[parent_code] = {
             'display_name': display_name,
@@ -669,44 +698,16 @@ def on_location_selected(change):
     device_options = []
     sorted_device_codes = details['device_codes']
     is_archive = (w_mode.value == 'Request Archived Data')
-    onc_service = state.get("onc_service")
-    all_params = state.get("all_params")
 
-    # Get device names and check for available files
-    temp_device_names = {}
-    devices_with_files = set()
-    
-    for dep in details['all_deployments']:
-        d_code = dep.get('deviceCode')
-        d_name = dep.get('deviceName', 'Unknown Device')
-        if d_code and d_code not in temp_device_names:
-            temp_device_names[d_code] = d_name
-            
-            # If in archive mode, check if this device has files
-            if is_archive and onc_service and all_params:
-                archive_filters = dict(
-                    deviceCode=d_code,
-                    dateFrom=utils.iso(all_params['start_dt'].astimezone(UTC)),
-                    dateTo=utils.iso(all_params['end_dt'].astimezone(UTC)),
-                    returnOptions='all'
-                )
-                try:
-                    list_result = onc_service.getArchivefile(filters=archive_filters, allPages=True)
-                    archive_files = list_result.get("files", [])
-                    if archive_files:
-                        devices_with_files.add(d_code)
-                except Exception as e:
-                    logging.warning(f"Error checking files for device {d_code}: {e}")
-                    continue
-    
-    state["devices_at_selected_location"] = temp_device_names
-
-    # In archive mode, only show devices with files
     if is_archive:
+        # Use preloaded device information
+        devices_with_files = [code for code in sorted_device_codes 
+                            if state["preloaded_device_files"].get(code, False)]
+        
         if devices_with_files:
             if len(devices_with_files) > 1:
                 device_options.append("ALL Hydrophones at this location")
-            sorted_device_codes = sorted(list(devices_with_files))
+            sorted_device_codes = sorted(devices_with_files)
         else:
             show_status("No devices found with available files.", target='discover', error=False)
             _toggle_widgets(False)
@@ -715,7 +716,16 @@ def on_location_selected(change):
         if len(sorted_device_codes) > 1:
             device_options.append("ALL Hydrophones at this location")
 
-    device_options.extend([f"{temp_device_names.get(code, 'Unknown')} ({code})" for code in sorted_device_codes])
+    # Use preloaded device names
+    device_options.extend([
+        f"{state['preloaded_device_names'].get(code, 'Unknown')} ({code})" 
+        for code in sorted_device_codes
+    ])
+    
+    state["devices_at_selected_location"] = {
+        code: state["preloaded_device_names"].get(code, "Unknown Device")
+        for code in sorted_device_codes
+    }
 
     w_device_select.options = device_options
     w_device_select.disabled = False
