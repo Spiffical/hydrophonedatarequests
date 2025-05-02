@@ -560,7 +560,27 @@ def on_discover_button_clicked(b):
     # Clear previous selections etc.
     w_location_select.options = []; w_device_select.options = []; w_product_selection_area.children = []
     w_archive_selection_area.children = []; w_product_archive_label.value = ""; w_download_btn.disabled = True
-    state.clear(); w_output_area.clear_output(wait=True)
+    
+    # Initialize state with empty values instead of clearing completely
+    state.update({
+        "onc_service": None,
+        "deployments": [],
+        "location_map": {},
+        "parent_loc_choices": [],
+        "parent_loc_codes": [],
+        "parent_choice_details": {},
+        "devices_at_selected_location": {},
+        "selected_parent_code": None,
+        "available_products": {},
+        "available_archive_files": [],
+        "product_checkboxes": {},
+        "archive_checkboxes": {},
+        "chosen_deployments": [],
+        "all_params": {},
+        "preloaded_device_files": {},
+        "preloaded_device_names": {}
+    })
+    w_output_area.clear_output(wait=True)
 
     try:
         with w_output_area:
