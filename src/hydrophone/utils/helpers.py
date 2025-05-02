@@ -13,7 +13,7 @@ try:
 except ImportError:
     sys.exit("ERROR: 'python-dateutil' library not found. Please install it: pip install python-dateutil")
 
-from .config import ISO_FMT
+from hydrophone.config.settings import ISO_FMT
 
 # --- Formatting & Display ---
 
@@ -26,15 +26,26 @@ def human_size(b: int) -> str:
         b /= 1024
     return f"{b:,.1f} B" # Should be unreachable, but fallback
 
-def dbg(msg: str, obj: Any = None, args: Any = None):
-    """Prints debug messages and optional object pprint if debug flags are set."""
+def dbg_param(msg: str, obj: Any = None, debug_on: bool = False):
+    """Prints debug messages and optional object pprint if debug_on is True."""
     try:
-        if args and (args.debug or args.debug_net):
+        if debug_on:
             print(f"\n🟦 DEBUG: {msg}")
             if obj is not None:
                 pprint.pprint(obj, indent=2, width=110, sort_dicts=False)
-    except AttributeError: # Handle case where args might not have debug flags
-        pass
+    except Exception as e:
+        print(f"🟦 Error in dbg_param function: {e}")
+
+def dbg(msg: str, obj: Any = None, args: Any = None):
+    """Prints debug messages and optional object pprint if debug flags are set."""
+    try:
+        debug_on = False
+        if args:
+            try:
+                debug_on = args.debug or args.debug_net
+            except AttributeError:
+                pass # Ignore if args object doesn't have these attributes
+        dbg_param(msg, obj, debug_on)
     except Exception as e:
         print(f"🟦 Error in dbg function: {e}")
 
@@ -109,63 +120,87 @@ def parse_local(s: str, zone: tzfile) -> datetime:
 
 # --- Data Extraction ---
 
-def extract_mb(payload: dict, debug: bool = False) -> float:
-    """
-    Attempts to extract an estimated file size in Megabytes (MB) from various
-    keys in an ONC API response payload.
-    """
-    choice, mb = "<none>", 0.0
-    if not isinstance(payload, dict):
-        if debug: print(f"\n🟦 DEBUG: Invalid payload type for size extraction: {type(payload)}")
-        return 0.0
+def extract_bytes_from_response(payload: dict) -> int:
+    """Extracts size in bytes from various keys in ONC response."""
+    if not isinstance(payload, dict): return 0
 
-    # Map known size keys to their unit factor relative to Bytes
-    # (e.g., MB keys need * 1048576 to get Bytes)
-    val_map = {
-        "fileSize": 1.0,                        # Already in Bytes
-        "compressedFileSize": 1.0,              # Already in Bytes
-        "archiveSizeMB": 1048576.0,             # In MB
-        "estimatedFileSize": 1.0,               # Special handling for string values like "1.2 GB"
-        "estimatedFileSizeMB": 1048576.0,       # In MB
-        "expectedSizeMB": 1048576.0             # In MB
-    }
-    bytes_val = 0.0
+    size_keys = [
+        ('downloadSize', 1), # Often present in run result, usually bytes
+        ('fileSize', 1), # Bytes
+        ('uncompressedFileSize', 1), # Bytes
+        ('estimatedFileSize', 1), # Handle string units
+        ('compressedFileSize', 1), # Bytes
+        ('archiveSizeMB', 1024*1024), # MB
+        ('estimatedFileSizeMB', 1024*1024), # MB
+        ('expectedSizeMB', 1024*1024) # MB
+    ]
 
-    for key, factor_to_bytes in val_map.items():
+    for key, factor in size_keys:
         if key in payload and payload[key] is not None:
             val = payload[key]
             try:
-                if key == "estimatedFileSize" and isinstance(val, str):
-                    # Handle strings like "1.2 GB", "500 MB", "1024 KB", "512 B"
+                if key == 'estimatedFileSize' and isinstance(val, str):
                     s = str(val).strip().upper().replace(',', '')
                     n_str = ''.join(filter(lambda x: x.isdigit() or x == '.', s))
-                    if not n_str: continue # Skip if no number found
+                    if not n_str: continue
                     n = float(n_str)
-                    if 'GB' in s: bytes_val = n * 1024 * 1048576; choice = key; break
-                    elif 'MB' in s: bytes_val = n * 1048576; choice = key; break
-                    elif 'KB' in s: bytes_val = n * 1024; choice = key; break
-                    elif 'B' in s: bytes_val = n; choice = key; break
-                    else: bytes_val = n * 1048576; choice = key; break # Assume MB if no unit
+                    if 'GB' in s: return int(n * 1024 * 1024 * 1024)
+                    elif 'MB' in s: return int(n * 1024 * 1024)
+                    elif 'KB' in s: return int(n * 1024)
+                    elif 'B' in s: return int(n)
+                    else: return int(n * 1024 * 1024) # Assume MB if no unit
                 elif isinstance(val, (int, float)):
-                    # Handle numeric values, converting using the factor
-                    bytes_val = float(val) * factor_to_bytes
-                    choice = key
-                    break # Found a valid numeric size, stop searching
-                else:
-                     if debug: print(f"🟦 DEBUG: Skipping key '{key}' due to unexpected type: {type(val)}")
+                    return int(float(val) * factor)
+            except (ValueError, TypeError):
+                continue
 
-            except (ValueError, TypeError) as parse_err:
-                if debug: print(f"🟦 DEBUG: Could not parse size for key '{key}' with value '{val}': {parse_err}")
-                continue # Try next key
+    return 0
 
-    if bytes_val > 0:
-        mb = bytes_val / 1048576.0
+def extract_mb(payload: dict, debug: bool = False) -> float:
+    """
+    Attempts to extract an estimated file size in Megabytes (MB) from various
+    keys in an ONC API response payload. Uses extract_bytes_from_response.
+    """
+    bytes_val = extract_bytes_from_response(payload)
+    mb = bytes_val / 1048576.0
 
-    if debug and choice != "<none>":
-        print(f"\n╭─ Size Est. Key: '{choice}' (Value: {payload.get(choice, 'N/A')})")
-        # print(f"│  Payload: {payload}") # Optionally print full payload
-        print(f"╰─ Calculated: {mb:,.2f} MB ({human_size(int(bytes_val))})")
+    if debug and bytes_val > 0:
+        print(f"\n╭─ Size Est. Result: {mb:,.2f} MB ({human_size(bytes_val)})")
+        print(f"╰─ From Payload: {payload}")
     elif debug:
-         print(f"\n🟦 DEBUG: No usable size information found in payload: {payload}")
+        print(f"\n🟦 DEBUG: No usable size information found in payload: {payload}")
 
     return mb
+
+def retry_request(func, *args, max_retries=3, initial_wait=1, **kwargs):
+    """
+    Helper function to retry requests on 500 errors with exponential backoff.
+    
+    Args:
+        func: The function to retry
+        *args: Positional arguments to pass to the function
+        max_retries: Maximum number of retry attempts (default: 3)
+        initial_wait: Initial wait time in seconds before first retry (default: 1)
+        **kwargs: Keyword arguments to pass to the function
+        
+    Returns:
+        The result of the function call if successful
+        
+    Raises:
+        The last exception encountered if all retries fail
+    """
+    import time
+    import logging
+    import requests
+
+    for attempt in range(max_retries):
+        try:
+            return func(*args, **kwargs)
+        except requests.exceptions.HTTPError as e:
+            if e.response is not None and e.response.status_code == 500:
+                if attempt < max_retries - 1:  # Don't wait after the last attempt
+                    wait_time = initial_wait * (2 ** attempt)  # Exponential backoff
+                    logging.warning(f"Got 500 error, retrying in {wait_time}s (attempt {attempt + 1}/{max_retries})...")
+                    time.sleep(wait_time)
+                    continue
+            raise  # Re-raise the exception if it's not a 500 error or we're out of retries

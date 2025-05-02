@@ -1,9 +1,12 @@
+"""
+ONC API client module for hydrophone data retrieval
+"""
 import logging
 import re
 import time
 from datetime import datetime, timezone
 from collections import defaultdict
-from typing import Dict, List, Tuple, Any, Optional
+from typing import Dict, List, Tuple, Any, Optional, Union
 from pathlib import Path
 import pprint
 import requests
@@ -32,10 +35,10 @@ except AttributeError as ae:
      else: sys.exit(f"ERROR: Unexpected AttributeError during import: {ae}")
 
 
-from . import utils
-from . import ui
-from .config import PNG_DEFAULT_PARAMS, WAV_DEFAULT_PARAMS, SUPPORTED_EXTENSIONS
-from .exceptions import ONCInteractionError, NoDataError, DownloadError
+from hydrophone.utils import helpers as utils
+from hydrophone.cli import ui
+from hydrophone.config.settings import PNG_DEFAULT_PARAMS, SUPPORTED_EXTENSIONS, DPO_MAPPINGS
+from hydrophone.utils.exceptions import ONCInteractionError, NoDataError, DownloadError
 
 # --- Discovery Functions ---
 
@@ -386,10 +389,9 @@ def select_data_products(
         for p in prod_opts:
             if isinstance(p, dict) and p.get('extension'):
                 ext = p['extension'].lower()
-                # Skip MP3 and WAV files as they are no longer generated
-                if ext in ('mp3', 'wav'):
-                    continue
-                ext2opt[ext].append(p)
+                # Only include extensions that are in our supported list
+                if ext in SUPPORTED_EXTENSIONS:
+                    ext2opt[ext].append(p)
         available_data_products = ext2opt
 
         # Only check for FLAC availability in archive mode
@@ -443,19 +445,16 @@ def select_data_products(
                 # For each extension, show available products and let user pick
                 products = available_data_products[ext]
                 if len(products) == 1:
-                    chosen_products[ext] = products[0]
+                    chosen_products[ext] = [products[0]]  # Store as list for consistent handling
                     logging.info(f"Selected {ext.upper()}: {products[0].get('dataProductName','?')} ({products[0].get('dataProductCode','?')})")
                 else:
-                    print(f"\nMultiple {ext.upper()} products available. Please select one:")
-                    for i, p in enumerate(products):
-                        print(f"{i+1}. {p.get('dataProductName', '?')} ({p.get('dataProductCode', '?')})")
-                    try:
-                        choice = ui.prompt_pick([f"{p.get('dataProductName', '?')} ({p.get('dataProductCode', '?')})" for p in products],
-                                              f"Select {ext.upper()} product")
-                        chosen_products[ext] = products[choice]
-                        logging.info(f"Selected {ext.upper()}: {products[choice].get('dataProductName','?')} ({products[choice].get('dataProductCode','?')})")
-                    except (EOFError, KeyboardInterrupt):
-                        raise ui.UserAbortError("User aborted.")
+                    print(f"\nMultiple {ext.upper()} products available. Please select one or more:")
+                    choices = ui.prompt_pick([f"{p.get('dataProductName', '?')} ({p.get('dataProductCode', '?')})" for p in products],
+                                              f"Select {ext.upper()} product(s)", allow_multiple=True)
+                    # Store selected products as a list under the extension key
+                    chosen_products[ext] = [products[choice] for choice in choices]
+                    for product in chosen_products[ext]:
+                        logging.info(f"Selected {ext.upper()}: {product.get('dataProductName','?')} ({product.get('dataProductCode','?')})")
         
         if not chosen_products:
             requested_types = [k for k,v in wanted_explicit.items() if v]
@@ -487,14 +486,16 @@ def select_data_products(
                 ans = input(f"\nDownload {ext.upper()} products? [y/N] ").lower()
                 if ans == 'y':
                     if len(products) == 1:
-                        chosen_products[ext] = products[0]
+                        chosen_products[ext] = [products[0]]  # Store as list for consistent handling
                         logging.info(f"Selected {ext.upper()}: {products[0].get('dataProductName','?')} ({products[0].get('dataProductCode','?')})")
                     else:
-                        print(f"\nMultiple {ext.upper()} products available. Please select one:")
-                        choice = ui.prompt_pick([f"{p.get('dataProductName', '?')} ({p.get('dataProductCode', '?')})" for p in products],
-                                              f"Select {ext.upper()} product")
-                        chosen_products[ext] = products[choice]
-                        logging.info(f"Selected {ext.upper()}: {products[choice].get('dataProductName','?')} ({products[choice].get('dataProductCode','?')})")
+                        print(f"\nMultiple {ext.upper()} products available. Please select one or more:")
+                        choices = ui.prompt_pick([f"{p.get('dataProductName', '?')} ({p.get('dataProductCode', '?')})" for p in products],
+                                              f"Select {ext.upper()} product(s)", allow_multiple=True)
+                        # Store selected products as a list under the extension key
+                        chosen_products[ext] = [products[choice] for choice in choices]
+                        for product in chosen_products[ext]:
+                            logging.info(f"Selected {ext.upper()}: {product.get('dataProductName','?')} ({product.get('dataProductCode','?')})")
             except (EOFError, KeyboardInterrupt):
                 raise ui.UserAbortError("User aborted.")
 
@@ -509,15 +510,22 @@ def select_data_products(
 def request_onc_jobs(
     onc_client: ONC,
     chosen_deps: List[Dict],
-    chosen_products: Dict[str, Dict],
+    chosen_products: Dict[str, Union[Dict, List[Dict]]], # Allow list for multiple products per ext
     start_utc: datetime,
     end_utc: datetime,
-    args: Any
+    args: Any # Should now behave like an object with attributes from params dict
 ) -> Tuple[List[Tuple[str, Any, str, str]], int]:
-    """Requests data product or archive jobs from ONC."""
+    """
+    Requests data product or prepares archive download jobs from ONC.
+    Bypasses interactive archive listing/prompting if 'selected_archive_extensions'
+    is present in args (passed from UI).
+    """
     logging.info("Requesting data products or preparing archive downloads...")
     total_bytes_est = 0
     jobs = []
+    is_archive_mode = getattr(args, 'archive', False)
+    is_test_mode = getattr(args, 'test', False)
+    ui_selected_archive_exts = getattr(args, 'selected_archive_extensions', None)
 
     for dep in chosen_deps:
         device_code = dep.get("deviceCode")
@@ -526,18 +534,38 @@ def request_onc_jobs(
             continue
 
         logging.info(f"--- Preparing requests for Device: {device_code} ({dep.get('deviceName','?')}) ---")
-        
-        if args.archive or args.test:
-            # In archive/test mode, first list all available files
-            logging.info(f"Listing all available archive files...")
+
+        if is_archive_mode:
+            if ui_selected_archive_exts is not None:
+                # UI provided selections - bypass listing and prompting
+                logging.info(f"Archive mode: Using pre-selected extensions from UI: {ui_selected_archive_exts}")
+                if not ui_selected_archive_exts:
+                    logging.warning("UI provided empty selection list for archive mode. No jobs created.")
+                    continue
+
+                # Create jobs directly from selected extensions
+                for ext in ui_selected_archive_exts:
+                    archive_filters_ext = dict(
+                        deviceCode=device_code,
+                        dateFrom=utils.iso(start_utc),
+                        dateTo=utils.iso(end_utc),
+                        extension=ext.lower(), # Ensure lowercase
+                        returnOptions='all'
+                    )
+                    jobs.append(('archive', archive_filters_ext, device_code, ext))
+                    logging.info(f"  Prepared archive job for extension: {ext}")
+                continue # Skip the rest of the loop for this deployment
+
+            # Original CLI interactive logic for archive/test mode
+            logging.info(f"Archive/Test mode: Listing all available files interactively...")
             archive_filters = dict(
                 deviceCode=device_code,
                 dateFrom=utils.iso(start_utc),
                 dateTo=utils.iso(end_utc),
-                returnOptions='all'  # Request detailed file information
+                returnOptions='all'
             )
-            utils.dbg("Archive Request Filters:", archive_filters, args=args)
-            
+            utils.dbg("Archive Request Filters (Interactive):", archive_filters, args=args)
+
             try:
                 list_result = onc_client.getArchivefile(filters=archive_filters, allPages=True)
                 potential_files = list_result.get("files", [])
@@ -545,176 +573,139 @@ def request_onc_jobs(
                 logging.info(f"Found {files_found} {'file' if files_found == 1 else 'files'}.")
 
                 if files_found > 0:
-                    # Group files by extension
-                    files_by_ext = {}
-                    for file_info in potential_files:
-                        if not isinstance(file_info, dict):
-                            continue
-                        filename = file_info.get('filename')
-                        if not filename:
-                            continue
-                            
-                        # Extract extension
-                        ext = filename.split('.')[-1].lower() if '.' in filename else 'unknown'
-                        
-                        # Skip thumbnail and small versions of PNG files
-                        if ext == 'png' and ('-small.png' in filename or '-thumb.png' in filename):
-                            continue
-                            
-                        if ext not in files_by_ext:
-                            files_by_ext[ext] = []
-                        files_by_ext[ext].append(file_info)
-                    
-                    # Print files grouped by extension
+                    files_by_ext = defaultdict(lambda: {'count': 0, 'size': 0})
                     total_size = 0
-                    ext_sizes = {}  # Store sizes by extension
+                    for file_info in potential_files:
+                        if not isinstance(file_info, dict): continue
+                        filename = file_info.get('filename')
+                        if not filename: continue
+                        is_png = '.png' in filename.lower()
+                        is_thumb_small = is_png and ('-small.png' in filename.lower() or '-thumb.png' in filename.lower())
+                        if is_thumb_small: continue
+                        file_size = file_info.get('uncompressedFileSize', file_info.get('fileSize', 0))
+                        ext = filename.split('.')[-1].lower() if '.' in filename else 'unknown'
+                        files_by_ext[ext]['count'] += 1
+                        files_by_ext[ext]['size'] += file_size
+                        total_size += file_size
+
+                    # Display summary (similar to UI build but for console)
+                    print("\nAvailable file types:")
+                    print("-" * 60)
+                    ext_sizes = {}
                     for ext in sorted(files_by_ext.keys()):
-                        files = files_by_ext[ext]
-                        print(f"\n{ext.upper()} Files ({len(files)} {'file' if len(files) == 1 else 'files'} found):")
-                        print("-" * 100)
-                        ext_size = 0
-                        
-                        # Sort files by filename within each extension group
-                        sorted_files = sorted(files, key=lambda x: x.get('filename', ''))
-                        
-                        # Get size for all files in this extension group
-                        for i, file_info in enumerate(sorted_files, 1):
-                            filename = file_info.get('filename', '')
-                            file_size = file_info.get('uncompressedFileSize', file_info.get('fileSize', 0))
-                            
-                            ext_size += file_size
-                            if i <= 3:  # Only show first 3 files
-                                print(f"{i:3d}. {filename:<75} {utils.human_size(file_size):>10}")
-                        
-                        if len(files) > 3:
-                            print(f"    ... and {len(files) - 3} more files ...")
-                        
-                        total_size += ext_size
-                        ext_sizes[ext] = ext_size  # Store size for this extension
-                        print(f"Total {ext.upper()} size: {utils.human_size(ext_size)}")
-                    
-                    print("\n" + "-" * 100)
+                        info = files_by_ext[ext]
+                        print(f"  {ext.upper()} Files ({info['count']}, {utils.human_size(info['size'])})")
+                        ext_sizes[ext] = info['size']
+                    print("-" * 60)
                     print(f"Total size of all files: {utils.human_size(total_size)}")
-                    print("-" * 100)
-                    
-                    # In test mode, we're done after listing
-                    if args.test:
-                        jobs.append(('archive', archive_filters, device_code, 'all'))
+                    print("-" * 60)
+
+                    if is_test_mode:
+                        logging.info("Test mode enabled. Skipping download prompt.")
                         continue
-                    
-                    # In archive mode, prompt user for which types to download
+
+                    # Prompt user which types to download (CLI ONLY)
                     print("\nSelect file types to download:")
                     wanted_exts = []
-                    for ext in sorted(files_by_ext.keys()):
-                        try:
-                            ext_files = files_by_ext[ext]
-                            ext_size = ext_sizes[ext]  # Use stored size
-                            ans = input(f"Download {ext.upper()} files? ({len(ext_files)} files, {utils.human_size(ext_size)}) [y/N] ").lower()
+                    try:
+                        for ext in sorted(files_by_ext.keys()):
+                            info = files_by_ext[ext]
+                            ans = input(f"Download {ext.upper()} files? ({info['count']} files, {utils.human_size(info['size'])}) [y/N] ").lower()
                             if ans == 'y':
                                 wanted_exts.append(ext)
-                        except (EOFError, KeyboardInterrupt):
-                            raise ui.UserAbortError("User aborted.")
-                    
+                    except (EOFError, KeyboardInterrupt):
+                        raise ui.UserAbortError("User aborted.")
+
                     if not wanted_exts:
                         logging.warning("No file types selected for download.")
                         continue
-                    
+
                     # Create archive jobs for selected extensions
                     for ext in wanted_exts:
                         archive_filters_ext = archive_filters.copy()
                         archive_filters_ext['extension'] = ext
                         jobs.append(('archive', archive_filters_ext, device_code, ext))
-                        # Add to total size estimate using stored size for this extension
                         total_bytes_est += ext_sizes[ext]
-                
-                else:
-                    logging.info("No archive files found for the specified time range.")
-                    
+
             except Exception as e:
-                logging.error(f"Error listing archive files: {e}", exc_info=args.debug)
-                raise ONCInteractionError(f"Failed to list archive files: {e}")
-                
+                logging.error(f"Error listing/processing archive files interactively: {e}", exc_info=args.debug)
+                raise ONCInteractionError(f"Failed to list/process archive files interactively: {e}") from e
+
         else:
-            # Normal data product mode - process each requested product
-            for ext, prod in chosen_products.items():
-                if ext == 'flac':
-                    # Handle FLAC as archive request
-                    logging.info(f"Preparing FLAC archive request...")
-                    archive_filters = dict(
-                        deviceCode=device_code,
-                        dateFrom=utils.iso(start_utc),
-                        dateTo=utils.iso(end_utc),
-                        extension='flac'
-                    )
-                    utils.dbg("FLAC Archive Request Filters:", archive_filters, args=args)
-                    jobs.append(('archive', archive_filters, device_code, ext))
-                    
-                    # Size estimation for FLAC
-                    duration_hours = (end_utc - start_utc).total_seconds() / 3600
-                    rough_flac_est_mb = duration_hours * 6 * 100
-                    total_bytes_est += int(rough_flac_est_mb * 1048576)
-                    logging.info(f"  FLAC archive request prepared. Rough Est: {utils.human_size(int(rough_flac_est_mb*1048576))}")
-                else:
-                    # Handle other data products (PNG, TXT, etc.)
-                    logging.info(f"Preparing {ext.upper()} data product request...")
-                    dp_filters = dict(
-                        deviceCode=device_code,
-                        dateFrom=utils.iso(start_utc),
-                        dateTo=utils.iso(end_utc),
-                        dataProductCode=prod.get('dataProductCode'),
-                        extension=ext
-                    )
-                    utils.dbg(f"{ext.upper()} Data Product Request Filters:", dp_filters, args=args)
-                    
+            # Data Product Mode Logic
+            for ext, prod_info in chosen_products.items():
+                if ext == 'flac': continue # Should not happen if is_archive is False
+                products_to_request = prod_info if isinstance(prod_info, list) else [prod_info]
+
+                for product in products_to_request:
                     try:
-                        # Request the data product to get size estimate
-                        request_result = onc_client.requestDataProduct(filters=dp_filters)
-                        if isinstance(request_result, dict):
-                            request_id = request_result.get('dpRequestId')
-                            if request_id:
-                                jobs.append(('dataproduct', request_id, device_code, ext))
-                                # Parse size estimate - handle both byte count and human readable formats
-                                est_size = 0
-                                size_str = str(request_result.get('estimatedFileSize', '')).lower()
-                                if size_str and 'no' not in size_str and 'available' not in size_str:  # Skip "no ... available" messages
-                                    if 'mb' in size_str:
-                                        try:
-                                            est_size = int(float(size_str.replace('mb','').strip()) * 1024 * 1024)
-                                        except ValueError:
-                                            est_size = 0
-                                    elif 'kb' in size_str:
-                                        try:
-                                            est_size = int(float(size_str.replace('kb','').strip()) * 1024)
-                                        except ValueError:
-                                            est_size = 0
-                                    elif 'b' in size_str:
-                                        try:
-                                            est_size = int(float(size_str.replace('b','').strip()))
-                                        except ValueError:
-                                            est_size = 0
-                                    else:
-                                        try:
-                                            est_size = int(size_str)
-                                        except ValueError:
-                                            est_size = 0
-                                elif 'downloadSize' in request_result:
-                                    try:
-                                        est_size = int(request_result['downloadSize'])
-                                    except (ValueError, TypeError):
-                                        est_size = 0
-                                total_bytes_est += est_size
-                                size_display = utils.human_size(est_size) if est_size > 0 else "unknown size"
-                                logging.info(f"  {ext.upper()} request prepared. Est: {size_display}")
-                            else:
-                                logging.warning(f"No request ID returned for {ext.upper()} product. Skipping.")
+                        product_code = product.get('dataProductCode')
+                        if not product_code:
+                            logging.warning(f"Skipping product with missing code for ext '{ext}'")
+                            continue
+
+                        logging.info(f"Preparing {ext.upper()} data product request for {product_code}...")
+                        dp_filters = dict(
+                            deviceCode=device_code,
+                            dateFrom=utils.iso(start_utc),
+                            dateTo=utils.iso(end_utc),
+                            dataProductCode=product_code,
+                            extension=ext,
+                            method='request'
+                        )
+
+                        dpo_key = (product_code, ext.lower())
+                        if dpo_key in DPO_MAPPINGS:
+                            dp_filters.update(DPO_MAPPINGS[dpo_key])
+                            utils.dbg(f"Applied DPO mapping for {dpo_key}", DPO_MAPPINGS[dpo_key], args=args)
                         else:
-                            logging.warning(f"Unexpected response for {ext.upper()} product request. Skipping.")
-                    except Exception as e:
-                        logging.error(f"Error requesting {ext.upper()} product: {e}", exc_info=args.debug)
-                        raise ONCInteractionError(f"Failed to request {ext.upper()} data product: {e}")
+                            logging.warning(f"No DPO mapping found for product {product_code} with extension {ext}")
+
+                        utils.dbg(f"{ext.upper()} DP Request Filters:", dp_filters, args=args)
+
+                        try:
+                            request_result = utils.retry_request(
+                                onc_client.requestDataProduct,
+                                filters=dp_filters,
+                                max_retries=3,
+                                initial_wait=2
+                            )
+
+                            if isinstance(request_result, dict):
+                                request_id = request_result.get('dpRequestId')
+                                if request_id:
+                                    jobs.append(('dataproduct', request_id, device_code, ext))
+                                    est_size = utils.extract_bytes_from_response(request_result)
+                                    total_bytes_est += est_size
+                                    size_display = utils.human_size(est_size) if est_size > 0 else "unknown size"
+                                    logging.info(f"  {ext.upper()} request prepared ({product_code}). Est: {size_display}")
+                                else:
+                                    logging.warning(f"No request ID returned for {ext.upper()} product {product_code}. Skipping.")
+                            else:
+                                logging.warning(f"Unexpected response type ({type(request_result)}) for {ext.upper()} product {product_code}. Skipping.")
+
+                        except requests.exceptions.HTTPError as http_err:
+                            err_text = str(http_err).lower()
+                            if http_err.response is not None and http_err.response.status_code == 400 and ("api error 71" in err_text or "permissions not granted" in err_text or "api error 141" in err_text):
+                                logging.warning(f"⚠ Skipping request for {product_code} ({ext}) due to API error (e.g., permissions, missing DPO): {http_err}")
+                            else:
+                                logging.error(f"✖ HTTP error requesting {ext.upper()} product {product_code}: {http_err}", exc_info=args.debug)
+                            continue
+                        except Exception as e:
+                            logging.error(f"✖ Error requesting {ext.upper()} product {product_code}: {e}", exc_info=args.debug)
+                            continue
+
+                    except Exception as outer_e:
+                        logging.error(f"✖ Unexpected error preparing {ext.upper()} product {product_code}: {outer_e}", exc_info=args.debug)
+                        continue
 
     if not jobs:
-        raise NoDataError("No archive requests or data product jobs could be prepared.")
+        # Raise NoDataError only if the *initial* parameters didn't lead to any jobs.
+        # If UI selections were empty, we logged a warning but don't need to raise here.
+        if not is_archive_mode or ui_selected_archive_exts is None:
+            raise NoDataError("No archive requests or data product jobs could be prepared.")
+        else:
+            logging.warning("No jobs created based on empty UI selection for archive mode.")
 
     return jobs, total_bytes_est
 
