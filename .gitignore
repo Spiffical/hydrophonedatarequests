@@ -4,3 +4,4 @@
 src/utils/grab_onc_openapi.py
 *.yaml
 *.txt
+!requirements.txt
