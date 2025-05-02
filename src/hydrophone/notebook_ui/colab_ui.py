@@ -57,7 +57,7 @@ DEFAULT_TIMEZONES = [
 
 # Google Drive Mount Path
 DRIVE_MOUNT_PATH = '/content/drive'
-DRIVE_MYDRIVE_PATH = os.path.join(DRIVE_MOUNT_PATH, 'MyDrive')  # More specific
+DRIVE_MYDRIVE_PATH = os.path.join(DRIVE_MOUNT_PATH, 'MyDrive')
 
 # --- Add CSS for spinner animation ---
 display(HTML("""
@@ -125,6 +125,18 @@ w_drive_mount_instruct = widgets.HTML(value="""
     <i>Then select the target folder above.</i>
 </div>
 """, layout=widgets.Layout(display='none'))
+
+# Fallback widgets for when FileChooser isn't available
+w_drive_widget_placeholder = widgets.HTML("<b>Enter Google Drive Path:</b>")
+w_drive_path_manual = widgets.Text(
+    description="Drive Path:",
+    value="",
+    placeholder="/content/drive/MyDrive/downloads",
+    layout=widgets.Layout(width='auto', min_width='300px', display='none')
+)
+
+# Container for Drive-related widgets
+w_download_drive_container = widgets.VBox([], layout=widgets.Layout(width='95%'))
 
 # Group download location widgets
 w_download_location_box = widgets.VBox([
@@ -224,7 +236,8 @@ state = {
     "product_checkboxes": {},  # {(prod_code, ext): checkbox_widget}
     "archive_checkboxes": {},  # {ext: checkbox_widget}
     "chosen_deployments": [],
-    "all_params": {}
+    "all_params": {},
+    "drive_file_chooser_instance": None  # Store the instance if created
 }
 
 # --- Helper Functions ---
@@ -842,13 +855,36 @@ def on_download_target_change(change):
     target = change['new']
     if target == 'Google Drive':
         w_colab_path.layout.display = 'none'
-        w_drive_folder_picker.layout.display = 'block'
         w_drive_mount_instruct.layout.display = 'block'
+        
+        # Conditionally create/show FileChooser or fallback
+        if FILECHOOSER_AVAILABLE:
+            # Create instance only if needed and not already created
+            if state.get("drive_file_chooser_instance") is None:
+                # Check if Drive is mounted BEFORE creating FileChooser
+                if COLAB_ENV and os.path.isdir(DRIVE_MYDRIVE_PATH):
+                    fc = FileChooser(DRIVE_MYDRIVE_PATH)  # Start in MyDrive
+                    fc.title = '<b>Select Google Drive Destination Folder</b>'
+                    fc.show_only_dirs = True
+                    state["drive_file_chooser_instance"] = fc
+                    w_download_drive_container.children = [fc]  # Add instance to container
+                else:
+                    # Drive not mounted, show message instead of picker
+                    drive_not_mounted_msg = widgets.HTML(
+                        "<i style='color:orange'>Mount Google Drive first to enable folder picker.</i>"
+                    )
+                    w_download_drive_container.children = [drive_not_mounted_msg]
+            else:
+                # Instance already exists, just ensure it's visible
+                w_download_drive_container.children = [state["drive_file_chooser_instance"]]
+        else:
+            # FileChooser not installed, show fallback manual input
+            w_download_drive_container.children = [w_drive_widget_placeholder, w_drive_path_manual]
+            w_drive_path_manual.layout.display = 'flex'  # Show manual input
     else:  # Colab Environment
         w_colab_path.layout.display = 'flex'
-        w_drive_folder_picker.layout.display = 'none'
+        w_download_drive_container.children = []  # Hide drive options
         w_drive_mount_instruct.layout.display = 'none'
-w_download_target.observe(on_download_target_change, names='value')
 
 # --- Mode Change Observer ---
 def on_mode_change(change):
@@ -873,7 +909,7 @@ w_location_select.observe(on_location_selected, names='value')
 w_device_select.observe(on_device_selected, names='value')
 w_download_btn.on_click(on_download_button_clicked)
 w_mode.observe(on_mode_change, names='value')
-w_download_target.observe(on_download_target_change, names='value') # Observe download target
+w_download_target.observe(on_download_target_change, names='value')
 
 # --- Main UI Display Function ---
 def display_ui():
