@@ -297,7 +297,7 @@ def _toggle_widgets(disabled: bool):
     # Determine if selections are complete enough to potentially enable download
     selections_ready = False
     if state.get("chosen_deployments"):  # Must have deployments selected
-        is_archive = (w_mode.value == 'Archive')
+        is_archive = (w_mode.value == 'Request Archived Data')
         if is_archive:
             # Archive mode: Ready if archive checkboxes dict *exists* (UI was built)
             selections_ready = state.get("archive_checkboxes") is not None  # Check existence, not emptiness
@@ -547,7 +547,7 @@ def on_discover_button_clicked(b):
             # --- End get download path ---
 
             tz_str = w_tz.value
-            is_archive = (w_mode.value == 'Archive'); is_test = is_archive
+            is_archive = (w_mode.value == 'Request Archived Data'); is_test = is_archive
             start_dt = _get_datetime_from_widgets(w_start_hbox.children[0], w_start_hbox.children[2], w_tz) # Get from HBox children
             end_dt = _get_datetime_from_widgets(w_end_hbox.children[0], w_end_hbox.children[2], w_tz) # Get from HBox children
 
@@ -703,7 +703,7 @@ def on_device_selected(change):
     first_device_code = first_chosen_dep.get("deviceCode")
 
     # Fetch Products or List Archive Files
-    is_archive = (w_mode.value == 'Archive')
+    is_archive = (w_mode.value == 'Request Archived Data')
     ui_widgets_to_add = []
 
     try:
@@ -772,7 +772,7 @@ def on_download_button_clicked(b):
             show_status("✖ State error: Discovery must complete successfully first.", target='download', error=True)
             _toggle_widgets(False); _set_button_state(w_download_btn, working=False); return
 
-        is_archive = (w_mode.value == 'Archive')
+        is_archive = (w_mode.value == 'Request Archived Data')
         params['archive'] = is_archive
         # *** Override 'test' flag for the download step ***
         # If the user clicked the download button, they intend to download,
