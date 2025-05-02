@@ -531,7 +531,15 @@ def on_discover_button_clicked(b):
                         show_status("✖ No valid Google Drive path input method available.", target='discover', error=True)
                         _toggle_widgets(False); _set_button_state(w_discover_btn, working=False); return
             else:  # Colab Environment
-                output_dir = w_colab_path.value.strip() or 'downloads'
+                # Get the parent directory of the current workspace
+                parent_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+                # Use the specified path or default to 'downloads', but place it at parent level
+                colab_path = w_colab_path.value.strip() or 'downloads'
+                # If path is relative, make it relative to parent directory
+                if not os.path.isabs(colab_path):
+                    output_dir = os.path.join(os.path.dirname(parent_dir), colab_path)
+                else:
+                    output_dir = colab_path
 
             if not output_dir:  # Should not happen if logic above is correct
                 show_status("✖ Could not determine output directory.", target='discover', error=True)
