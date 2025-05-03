@@ -5,7 +5,7 @@ import sys
 import pathlib
 import pprint
 from datetime import datetime
-from typing import Union, Any
+from typing import Union, Any, Dict, List, Optional, Set, Tuple
 
 try:
     from dateutil import parser as dtparse
@@ -14,17 +14,17 @@ except ImportError:
     sys.exit("ERROR: 'python-dateutil' library not found. Please install it: pip install python-dateutil")
 
 from hydrophone.config.settings import ISO_FMT
+from hydrophone.core.onc_client import ONC
 
 # --- Formatting & Display ---
 
-def human_size(b: int) -> str:
-    """Converts bytes to a human-readable string (KB, MB, GB, TB)."""
-    if b == 0: return "0 B"
-    b = float(b)
-    for u in ("B", "KB", "MB", "GB", "TB"):
-        if b < 1024 or u == "TB": return f"{b:,.1f} {u}"
-        b /= 1024
-    return f"{b:,.1f} B" # Should be unreachable, but fallback
+def human_size(size_bytes: Union[int, float]) -> str:
+    """Convert bytes to human readable string."""
+    for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
+        if size_bytes < 1024.0:
+            return f"{size_bytes:3.1f} {unit}"
+        size_bytes /= 1024.0
+    return f"{size_bytes:3.1f} PB"
 
 def dbg_param(msg: str, obj: Any = None, debug_on: bool = False):
     """Prints debug messages and optional object pprint if debug_on is True."""
@@ -204,3 +204,91 @@ def retry_request(func, *args, max_retries=3, initial_wait=1, **kwargs):
                     time.sleep(wait_time)
                     continue
             raise  # Re-raise the exception if it's not a 500 error or we're out of retries
+
+def parse_datetime(date_str: str) -> datetime:
+    """Parse datetime string to datetime object."""
+    return dtparse.parse(date_str)
+
+def ensure_dir(path: Union[str, pathlib.Path]) -> pathlib.Path:
+    """Ensure directory exists, create if not."""
+    path_obj = pathlib.Path(path)
+    if not path_obj.exists():
+        path_obj.mkdir(parents=True)
+    return path_obj
+
+def filter_deployments_with_data(
+    onc_client: ONC,
+    deployments: List[Dict],
+    start_utc: datetime,
+    end_utc: datetime,
+    is_archive: bool = False,
+    debug: bool = False
+) -> Tuple[List[Dict], Dict[str, bool]]:
+    """
+    Filter deployments to only those that have data available in the specified time range.
+    
+    Args:
+        onc_client: ONC API client instance
+        deployments: List of deployment dictionaries
+        start_utc: Start time in UTC
+        end_utc: End time in UTC
+        is_archive: Whether to check for archive files (True) or data products (False)
+        debug: Whether to show debug logging
+    
+    Returns:
+        Tuple of (filtered deployments list, dict mapping device codes to data availability)
+    """
+    from hydrophone.utils.parallel import check_archive_files_parallel
+    
+    # Get unique device codes
+    device_codes = set()
+    device_to_deployments = {}
+    for dep in deployments:
+        device_code = dep.get('deviceCode')
+        if device_code:
+            device_codes.add(device_code)
+            if device_code not in device_to_deployments:
+                device_to_deployments[device_code] = []
+            device_to_deployments[device_code].append(dep)
+    
+    if not device_codes:
+        return [], {}
+        
+    # Check for data availability
+    if is_archive:
+        # Use parallel check for archive files
+        device_has_data = check_archive_files_parallel(
+            onc_client,
+            list(device_codes),
+            start_utc,
+            end_utc,
+            max_workers=10,
+            debug=debug
+        )
+    else:
+        # Check for data products
+        device_has_data = {}
+        for device_code in device_codes:
+            try:
+                prod_opts = onc_client.getDataProducts({"deviceCode": device_code})
+                has_products = bool(prod_opts and isinstance(prod_opts, list) and prod_opts)
+                device_has_data[device_code] = has_products
+                if debug and not has_products:
+                    logging.debug(f"No data products found for device {device_code}")
+            except Exception as e:
+                if debug:
+                    logging.warning(f"Error checking data products for device {device_code}: {e}")
+                device_has_data[device_code] = False
+    
+    # Filter deployments to only those with data
+    filtered_deployments = []
+    for device_code, has_data in device_has_data.items():
+        if has_data and device_code in device_to_deployments:
+            filtered_deployments.extend(device_to_deployments[device_code])
+    
+    if debug:
+        total_devices = len(device_codes)
+        devices_with_data = sum(1 for has_data in device_has_data.values() if has_data)
+        logging.debug(f"Found {devices_with_data}/{total_devices} devices with available data")
+    
+    return filtered_deployments, device_has_data

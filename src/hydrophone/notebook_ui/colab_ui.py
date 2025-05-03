@@ -461,46 +461,41 @@ def _prepare_parent_location_choices(deployments, loc_map, onc_service=None, sta
         state["preloaded_device_names"].clear()
         
         print("Pre-loading device information...")
-        total_devices = sum(len(set(dep.get('deviceCode') for dep in deps if dep.get('deviceCode'))) 
-                          for deps in by_parent_loc.values())
-        devices_checked = 0
-        
+        # Collect all unique device codes and names
+        all_device_codes = []
         for parent_code in sorted_parent_codes:
             deployments_at_parent = by_parent_loc[parent_code]
-            # Check each device at this location
-            checked_devices = set()  # Track devices we've already checked at this location
-            
             for dep in deployments_at_parent:
                 device_code = dep.get('deviceCode')
                 device_name = dep.get('deviceName', 'Unknown Device')
-                
-                if not device_code or device_code in checked_devices:
-                    continue
-                    
-                checked_devices.add(device_code)
-                devices_checked += 1
-                print(f"\rChecking devices: {devices_checked}/{total_devices}", end="")
-                
-                # Store device name
-                state["preloaded_device_names"][device_code] = device_name
-                
-                # Check if this device has any files
-                archive_filters = dict(
-                    deviceCode=device_code,
-                    dateFrom=utils.iso(start_dt.astimezone(UTC)),
-                    dateTo=utils.iso(end_dt.astimezone(UTC)),
-                    returnOptions='all'
-                )
-                try:
-                    list_result = onc_service.getArchivefile(filters=archive_filters, allPages=True)
-                    has_files = bool(list_result.get("files", []))
-                    state["preloaded_device_files"][device_code] = has_files
-                    if has_files:
-                        locations_with_files.add(parent_code)
-                except Exception as e:
-                    logging.warning(f"Error checking files for device {device_code}: {e}")
-                    state["preloaded_device_files"][device_code] = False
-                    continue
+                if device_code and device_code not in state["preloaded_device_names"]:
+                    all_device_codes.append(device_code)
+                    state["preloaded_device_names"][device_code] = device_name
+        
+        print(f"Checking {len(all_device_codes)} unique devices for available files...")
+        
+        # Use parallel processing to check files
+        from hydrophone.utils.parallel import check_archive_files_parallel
+        device_has_files = check_archive_files_parallel(
+            onc_service,
+            all_device_codes,
+            start_dt.astimezone(UTC),
+            end_dt.astimezone(UTC),
+            max_workers=10,  # Adjust based on API limits
+            debug=state['all_params'].get('debug', False)
+        )
+        
+        # Update state and determine locations with files
+        state["preloaded_device_files"].update(device_has_files)
+        
+        # Determine which locations have files
+        for parent_code in sorted_parent_codes:
+            deployments_at_parent = by_parent_loc[parent_code]
+            for dep in deployments_at_parent:
+                device_code = dep.get('deviceCode')
+                if device_code and device_has_files.get(device_code, False):
+                    locations_with_files.add(parent_code)
+                    break
         
         print("\nDevice information pre-loading complete.")
                     

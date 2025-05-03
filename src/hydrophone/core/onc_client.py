@@ -48,100 +48,86 @@ def find_overlapping_deployments(
     end_utc: datetime,
     args: Any
 ) -> Tuple[List[Dict], Dict[str, str]]:
-    """Finds hydrophone deployments overlapping with the specified time range."""
-    logging.info("Fetching locations...")
-    try:
-        all_locations = onc_client.getLocations({})
-        loc_map = {l["locationCode"]: l["locationName"] for l in all_locations if isinstance(l, dict) and "locationCode" in l}
-        if not loc_map: logging.warning("No locations found or parsed.")
-        utils.dbg("Location map", loc_map if loc_map else "<empty>", args=args)
-    except Exception as e:
-        raise ONCInteractionError(f"Failed to get locations: {e}") from e
-
-    logging.info("Finding hydrophone deployments...")
-    utcnow = datetime.now(UTC)
-    deployments: List[Dict] = []
-    skipped_deployments_count = 0
-    skipped_devices_count = 0
-
-    try:
-        all_hydrophones = onc_client.getDevices({"deviceCategoryCode": "HYDROPHONE"})
-        if not all_hydrophones:
-            logging.info("No hydrophone devices found.")
-            return [], loc_map # Return empty list if no hydrophones
-    except Exception as e:
-        raise ONCInteractionError(f"Failed to get hydrophone devices: {e}") from e
-
-    for dev in all_hydrophones:
-        if not isinstance(dev, dict) or not dev.get("deviceCode"):
-            logging.warning("Skipping invalid device entry.")
-            skipped_devices_count += 1
-            continue
-        device_code = dev["deviceCode"]
-        utils.dbg(f"Checking deployments for {device_code} ({dev.get('deviceName','?')})", args=args)
-
+    """
+    Find hydrophone deployments that overlap with the specified time range.
+    
+    Args:
+        onc_client: ONC API client instance
+        start_utc: Start time in UTC
+        end_utc: End time in UTC
+        args: Arguments object with debug and archive flags
+    
+    Returns:
+        Tuple of (list of deployments, location map)
+    """
+    logging.info("Finding hydrophone locations and devices...")
+    
+    # Get location map first (needed for display names)
+    loc_response = onc_client.getLocations({})
+    loc_map = {loc.get('locationCode'): loc.get('locationName', '') 
+               for loc in loc_response if isinstance(loc, dict)}
+    
+    # Get all hydrophones
+    logging.info("Getting hydrophone device list...")
+    all_hydrophones = onc_client.getDevices({"deviceCategoryCode": "HYDROPHONE"})
+    if not isinstance(all_hydrophones, list):
+        raise ValueError("Unexpected response format from getDevices")
+    
+    if not all_hydrophones:
+        raise NoDataError("No hydrophone devices found.")
+    
+    logging.info(f"Found {len(all_hydrophones)} hydrophone device(s).")
+    
+    # Get deployments in parallel
+    from hydrophone.utils.parallel import get_deployments_parallel
+    all_deployments = get_deployments_parallel(
+        onc_client,
+        all_hydrophones,
+        max_workers=10,
+        debug=args.debug
+    )
+    
+    if not all_deployments:
+        raise NoDataError("No deployments found for any hydrophone devices.")
+    
+    logging.info(f"Found {len(all_deployments)} total deployment(s).")
+    
+    # Filter deployments by time overlap
+    overlapping = []
+    for dep in all_deployments:
         try:
-            device_deployments = onc_client.getDeployments({"deviceCode": device_code})
-            if not isinstance(device_deployments, list):
-                logging.warning(f"Unexpected response type ({type(device_deployments)}) for {device_code} deployments. Skipping device.")
-                skipped_devices_count += 1
-                continue
-
-            for dep in device_deployments:
-                if not isinstance(dep, dict):
-                    skipped_deployments_count += 1
-                    continue # Skip malformed deployment entries
-                try:
-                    begin_str = dep.get("begin")
-                    if not begin_str:
-                        skipped_deployments_count += 1
-                        continue # Skip deployment without a start date
-
-                    # Parse deployment dates, assuming UTC if naive
-                    b = dtparse.isoparse(begin_str)
-                    if b.tzinfo is None: b = b.replace(tzinfo=UTC)
-                    else: b = b.astimezone(UTC)
-
-                    e_str = dep.get("end")
-                    e = dtparse.isoparse(e_str) if e_str else utcnow # Use current time if no end date
-                    if e.tzinfo is None: e = e.replace(tzinfo=UTC)
-                    else: e = e.astimezone(UTC)
-
-                    # Check for overlap: (DepStart <= ReqEnd) and (DepEnd >= ReqStart)
-                    if b <= end_utc and e >= start_utc:
-                        d_info = dev.copy()
-                        d_info.update(dep) # Combine device and deployment info
-                        deployments.append(d_info)
-                        logging.info(f"  -> Found overlap: {device_code} ({b.strftime('%Y-%m-%d')} to {e.strftime('%Y-%m-%d') if e_str else 'now'})")
-                    #else:
-                    #    utils.dbg(f"  -> No overlap: {device_code} ({b.strftime('%Y-%m-%d')} to {e.strftime('%Y-%m-%d') if e_str else 'now'}) vs Req: ({start_utc.strftime('%Y-%m-%d')} to {end_utc.strftime('%Y-%m-%d')})", args=args)
-
-                except (dtparse.ParserError, ValueError) as date_err:
-                    logging.warning(f"Could not parse dates for deployment of {device_code}. Begin: '{dep.get('begin')}', End: '{dep.get('end')}'. Error: {date_err}")
-                    skipped_deployments_count += 1
-                except Exception as inner_e:
-                    logging.warning(f"Error processing deployment entry for {device_code}: {inner_e}")
-                    skipped_deployments_count += 1
-
-        except HTTPError as http_err:
-            if http_err.response is not None and http_err.response.status_code == 404:
-                utils.dbg(f"No deployments found (404) for device {device_code}. Skipping device.", args=args)
-            else:
-                logging.warning(f"HTTPError getting deployments for {device_code}: {http_err}")
-            skipped_devices_count += 1
-            continue # Skip to the next device
+            begin = utils.parse_datetime(dep.get('begin'))
+            end = utils.parse_datetime(dep.get('end')) if dep.get('end') else None
+            
+            # Check if deployment overlaps with requested time range
+            if (begin <= end_utc) and (not end or end >= start_utc):
+                overlapping.append(dep)
         except Exception as e:
-            logging.warning(f"Unexpected error getting deployments for {device_code}: {e}", exc_info=args.debug)
-            skipped_devices_count += 1
-            continue # Skip to the next device
-
-    if skipped_deployments_count > 0: logging.info(f"Note: Skipped {skipped_deployments_count} individual deployment entries due to date/parse issues.")
-    if skipped_devices_count > 0: logging.info(f"Note: Skipped {skipped_devices_count} devices for which deployments could not be retrieved (e.g., 404 or other errors).")
-    if not deployments:
+            if args.debug:
+                logging.warning(f"Skipping deployment with invalid dates: {e}")
+            continue
+    
+    if not overlapping:
         raise NoDataError("No overlapping hydrophone deployments found for the specified time range.")
-
-    logging.info(f"Found {len(deployments)} overlapping deployments.")
-    return deployments, loc_map
+    
+    logging.info(f"Found {len(overlapping)} overlapping deployment(s).")
+    
+    # Filter to only deployments that have data available
+    filtered_deployments, device_has_data = utils.filter_deployments_with_data(
+        onc_client,
+        overlapping,
+        start_utc,
+        end_utc,
+        is_archive=args.archive,
+        debug=args.debug
+    )
+    
+    if not filtered_deployments:
+        raise NoDataError("No deployments found with available data in the specified time range.")
+    
+    logging.info(f"Found {len(filtered_deployments)} deployment(s) with available data.")
+    
+    return filtered_deployments, loc_map
 
 
 def _extract_name_from_citation(citation_string: Optional[str]) -> Optional[str]:
