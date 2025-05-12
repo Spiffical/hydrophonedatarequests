@@ -11,6 +11,7 @@ from pathlib import Path
 import pprint
 import requests
 import zipfile
+import shutil # Added for rmtree
 try:
     from dateutil import parser as dtparse
     from dateutil.tz import gettz, UTC
@@ -989,6 +990,9 @@ def process_download_jobs(
     total_failure = 0
     total_skipped = 0
 
+    # Track successful downloads by device for organization
+    successful_device_downloads = defaultdict(bool)
+
     for job_type, request_info, device_code, ext in jobs:
         status_info: Dict[str, Any] = {
             'status': 'Unknown',
@@ -1226,6 +1230,10 @@ def process_download_jobs(
                 'files_failed': files_dp_failed
             }
 
+            # After successful download in data product section
+            if job_succeeded:
+                successful_device_downloads[device_code] = True
+
         # === Handle Archive File Downloads (e.g., if WAV fallback to archive is needed) ===
         elif job_type == 'archive':
             job_status_key = f"Archive_{device_code}_{ext}"
@@ -1399,6 +1407,10 @@ def process_download_jobs(
                 'files_failed': files_failed
             }
 
+            # After successful download in archive section
+            if job_succeeded:
+                successful_device_downloads[device_code] = True
+
         # Store job status and update overall success
         job_statuses[job_status_key] = status_info
         if status_info['status'] == 'Failed':
@@ -1408,6 +1420,41 @@ def process_download_jobs(
             total_skipped += 1
         else:
             total_success += 1
+
+    # After all jobs complete, organize files for devices with successful downloads
+    for device_code in successful_device_downloads:
+        try:
+            utils.organize_downloaded_files(output_path, device_code)
+        except Exception as e:
+            logging.warning(f"Failed to organize files for device {device_code}: {e}")
+
+    # Create a final zip file containing all organized data
+    if args.zip_output and any(successful_device_downloads):
+        zip_path = output_path / "organized_hydrophone_data.zip"
+        created_dirs_to_remove = []
+        try:
+            with zipfile.ZipFile(zip_path, 'w') as zipf:
+                for item in output_path.iterdir():
+                    if item.is_dir() and item.name != '__pycache__':
+                        # Record directory to remove later
+                        created_dirs_to_remove.append(item)
+                        for file in item.rglob('*'):
+                            if file.is_file():
+                                zipf.write(file, file.relative_to(output_path))
+            logging.info(f"Created zip file of organized data at: {zip_path}")
+
+            # Remove original organized folders after successful zipping
+            if created_dirs_to_remove:
+                logging.info(f"Removing original organized folders...")
+                for dir_to_remove in created_dirs_to_remove:
+                    try:
+                        shutil.rmtree(dir_to_remove)
+                        logging.info(f"  Removed: {dir_to_remove.name}")
+                    except Exception as e_rm:
+                        logging.warning(f"  Failed to remove {dir_to_remove.name}: {e_rm}")
+
+        except Exception as e:
+            logging.warning(f"Failed to create or cleanup after zip file: {e}")
 
     # Print final summary
     print("\n==============================")

@@ -143,6 +143,14 @@ w_opts_hbox = widgets.HBox([
     w_debug_net
 ], layout=widgets.Layout(margin='5px 0 0 0'))
 
+# Add zip checkbox to global widgets
+w_zip_output = widgets.Checkbox(
+    description='Create zip file of organized data',
+    value=False,
+    indent=True,
+    layout=widgets.Layout(width='auto')
+)
+
 # Action Buttons
 w_discover_btn = widgets.Button(
     description="1. Discover Locations & Devices",
@@ -863,6 +871,8 @@ def on_download_button_clicked(b):
     try:
         # --- Collect Final Parameters from STATE ---
         params = state['all_params'].copy()
+        # Add zip output parameter
+        params['zip_output'] = w_zip_output.value
         # Get required items from state, validate they exist
         params['onc_service'] = state.get('onc_service')
         params['chosen_deployments'] = state.get('chosen_deployments')
@@ -1067,6 +1077,16 @@ def display_ui():
     ]
     download_box = widgets.VBox(download_widgets, layout=widgets.Layout(margin='0 0 10px 0'))
 
+    # Add zip option to download section
+    download_options = widgets.VBox([
+        widgets.Label('Download Options:'),
+        widgets.HBox([w_download_target]),
+        w_colab_path,
+        w_drive_mount_instruct,
+        w_download_drive_container,
+        w_zip_output  # Add zip checkbox
+    ])
+
     # Combine sections
     ui_layout = widgets.VBox([
         setup_box,
@@ -1074,6 +1094,8 @@ def display_ui():
         discovery_box,
         widgets.HTML("<hr>"),
         selection_box,
+        widgets.HTML("<hr>"),
+        download_options,
         widgets.HTML("<hr>"),
         download_box,
         widgets.HTML("<hr>"),

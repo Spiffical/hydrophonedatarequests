@@ -36,4 +36,5 @@ def setup_arg_parser():
     ap.add_argument("--fallback-retries", type=int, default=12, help="Max fallback retries (default: 12)")
     ap.add_argument("--fallback-wait", type=float, default=5.0, help="Fallback wait time (s) (default: 5.0)")
     ap.add_argument("--fetch-sensitivity", action="store_true", help="Fetch and save hydrophone sensitivity calibration file(s)")
+    ap.add_argument("--zip-output", action="store_true", help="Create a zip file containing all organized data after download")
     return ap.parse_args()

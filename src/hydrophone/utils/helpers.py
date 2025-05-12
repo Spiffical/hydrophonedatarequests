@@ -292,3 +292,58 @@ def filter_deployments_with_data(
         logging.debug(f"Found {devices_with_data}/{total_devices} devices with available data")
     
     return filtered_deployments, device_has_data
+
+def organize_downloaded_files(output_path: pathlib.Path, device_code: str = None) -> None:
+    """
+    Organizes downloaded files into type-specific folders.
+    
+    Args:
+        output_path: Base path where files were downloaded
+        device_code: Optional device code to include in folder names
+    """
+    # Define data type mappings
+    DATA_TYPE_FOLDERS = {
+        'acc': 'Acceleration_Data',
+        'an': 'Annotation_Files',
+        'csv': 'Time_Series_Data',
+        'fft': 'Spectral_Data',
+        'flac': 'Audio_Data',
+        'json': 'Time_Series_Data',
+        'mat': 'Spectral_Data',
+        'pdf': 'Plot_Data',
+        'png': 'Plot_Data',
+        'txt': 'Log_Files'
+    }
+    
+    # Create a mapping of files to move
+    files_to_move = {}
+    
+    # Scan for files in the output directory
+    for file_path in output_path.glob('*.*'):
+        if not file_path.is_file():
+            continue
+            
+        # Get the file extension
+        ext = file_path.suffix.lower().lstrip('.')
+        if ext not in DATA_TYPE_FOLDERS:
+            continue
+            
+        # Determine target folder
+        folder_name = DATA_TYPE_FOLDERS[ext]
+        if device_code:
+            folder_name = f"{folder_name}_{device_code}"
+            
+        target_dir = output_path / folder_name
+        target_dir.mkdir(exist_ok=True)
+        
+        # Add to files to move
+        target_path = target_dir / file_path.name
+        files_to_move[file_path] = target_path
+    
+    # Move all files
+    for src_path, dst_path in files_to_move.items():
+        try:
+            if not dst_path.exists():
+                src_path.rename(dst_path)
+        except Exception as e:
+            logging.warning(f"Failed to move {src_path.name} to {dst_path}: {e}")
